@@ -75,9 +75,14 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
+    parser.add_argument('--dataset_split_mode', type=str, default='none',
+                        choices=['none', 'timestamp'],
+                        help='Dataset split mode: none = baseline Row Group split; '
+                             'timestamp = sort rows by timestamp and use the latest '
+                             'valid_ratio fraction for validation')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -249,6 +254,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        dataset_split_mode=args.dataset_split_mode,
     )
 
     # ---- NS groups ----

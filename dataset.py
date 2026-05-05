@@ -151,6 +151,7 @@ class PCVRParquetDataset(IterableDataset):
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
+        row_indices_map: Optional[Dict[Tuple[str, int], "npt.NDArray[np.int64]"]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
     ) -> None:
@@ -167,6 +168,9 @@ class PCVRParquetDataset(IterableDataset):
             buffer_batches: shuffle buffer size in units of batches.
             row_group_range: ``(start, end)`` slice of Row Groups; ``None`` to
                 use all Row Groups.
+            row_indices_map: optional map from ``(file_path, row_group_idx)``
+                to local row indices selected from that Row Group. Used by
+                timestamp-based row-level splitting.
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
@@ -188,6 +192,7 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self._row_indices_map = row_indices_map
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -203,7 +208,16 @@ class PCVRParquetDataset(IterableDataset):
             start, end = row_group_range
             self._rg_list = self._rg_list[start:end]
 
-        self.num_rows = sum(r[2] for r in self._rg_list)
+        if self._row_indices_map is not None:
+            self._rg_list = [
+                rg for rg in self._rg_list
+                if len(self._row_indices_map.get((rg[0], rg[1]), ())) > 0
+            ]
+            self.num_rows = sum(
+                len(self._row_indices_map[(f, i)]) for f, i, _ in self._rg_list
+            )
+        else:
+            self.num_rows = sum(r[2] for r in self._rg_list)
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
@@ -331,6 +345,12 @@ class PCVRParquetDataset(IterableDataset):
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
+        if self._row_indices_map is not None:
+            return sum(
+                (len(self._row_indices_map[(f, i)]) + self.batch_size - 1)
+                // self.batch_size
+                for f, i, _ in self._rg_list
+            )
         return sum((n + self.batch_size - 1) // self.batch_size
                    for _, _, n in self._rg_list)
 
@@ -344,7 +364,24 @@ class PCVRParquetDataset(IterableDataset):
         buffer: List[Dict[str, Any]] = []
         for file_path, rg_idx, _ in rg_list:
             pf = pq.ParquetFile(file_path)
+            selected_rows = None
+            if self._row_indices_map is not None:
+                selected_rows = self._row_indices_map.get((file_path, rg_idx))
+                if selected_rows is None or len(selected_rows) == 0:
+                    continue
+                selected_rows = np.asarray(selected_rows, dtype=np.int64)
+            batch_start = 0
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
+                if selected_rows is not None:
+                    batch_end = batch_start + batch.num_rows
+                    left = np.searchsorted(selected_rows, batch_start, side='left')
+                    right = np.searchsorted(selected_rows, batch_end, side='left')
+                    if right <= left:
+                        batch_start = batch_end
+                        continue
+                    rel_idx = selected_rows[left:right] - batch_start
+                    batch = batch.take(pa.array(rel_idx))
+                    batch_start = batch_end
                 batch_dict = self._convert_batch(batch)
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
@@ -669,6 +706,86 @@ class PCVRParquetDataset(IterableDataset):
         return result
 
 
+def _build_timestamp_split_row_indices(
+    rg_info: List[Tuple[str, int, int]],
+    valid_ratio: float,
+    train_ratio: float,
+) -> Tuple[
+    Dict[Tuple[str, int], "npt.NDArray[np.int64]"],
+    Dict[Tuple[str, int], "npt.NDArray[np.int64]"],
+    int,
+    int,
+]:
+    """Build row-level train/valid indices by sorting all rows by timestamp."""
+    timestamps = []
+    rg_ids = []
+    local_rows = []
+
+    for rg_id, (file_path, rg_idx, num_rows) in enumerate(rg_info):
+        pf = pq.ParquetFile(file_path)
+        table = pf.read_row_group(rg_idx, columns=['timestamp'])
+        ts = table.column('timestamp').combine_chunks().to_numpy(
+            zero_copy_only=False).astype(np.int64)
+        if len(ts) != num_rows:
+            raise ValueError(
+                f"timestamp row count mismatch for {file_path} row_group={rg_idx}: "
+                f"{len(ts)} vs metadata {num_rows}")
+        timestamps.append(ts)
+        rg_ids.append(np.full(len(ts), rg_id, dtype=np.int64))
+        local_rows.append(np.arange(len(ts), dtype=np.int64))
+
+    all_timestamps = np.concatenate(timestamps)
+    all_rg_ids = np.concatenate(rg_ids)
+    all_local_rows = np.concatenate(local_rows)
+    total_rows = len(all_timestamps)
+
+    n_valid = max(1, int(total_rows * valid_ratio))
+    n_train_window = total_rows - n_valid
+    n_train = n_train_window
+    if train_ratio < 1.0:
+        n_train = max(1, int(n_train_window * train_ratio))
+        logging.info(
+            f"train_ratio={train_ratio}: using {n_train} earliest rows "
+            f"from the timestamp training window")
+
+    order = np.argsort(all_timestamps, kind='stable')
+    train_order = order[:n_train]
+    valid_order = order[n_train_window:]
+
+    def _make_index_map(selection: "npt.NDArray[np.int64]") -> Dict[Tuple[str, int], "npt.NDArray[np.int64]"]:
+        result: Dict[Tuple[str, int], "npt.NDArray[np.int64]"] = {}
+        selected_rg_ids = all_rg_ids[selection]
+        selected_local_rows = all_local_rows[selection]
+        rg_order = np.argsort(selected_rg_ids, kind='stable')
+        selected_rg_ids = selected_rg_ids[rg_order]
+        selected_local_rows = selected_local_rows[rg_order]
+        start = 0
+        while start < len(selected_rg_ids):
+            rg_id = int(selected_rg_ids[start])
+            end = start + 1
+            while end < len(selected_rg_ids) and int(selected_rg_ids[end]) == rg_id:
+                end += 1
+            key = (rg_info[rg_id][0], rg_info[rg_id][1])
+            result[key] = np.sort(selected_local_rows[start:end].astype(np.int64))
+            start = end
+        return result
+
+    train_min = int(all_timestamps[train_order[0]]) if len(train_order) else 0
+    train_max = int(all_timestamps[train_order[-1]]) if len(train_order) else 0
+    valid_min = int(all_timestamps[valid_order[0]]) if len(valid_order) else 0
+    valid_max = int(all_timestamps[valid_order[-1]]) if len(valid_order) else 0
+    logging.info(
+        f"Timestamp split: train_rows={len(train_order)}, valid_rows={len(valid_order)}, "
+        f"train_ts=[{train_min}, {train_max}], valid_ts=[{valid_min}, {valid_max}]")
+
+    return (
+        _make_index_map(train_order),
+        _make_index_map(valid_order),
+        len(train_order),
+        len(valid_order),
+    )
+
+
 def get_pcvr_data(
     data_dir: str,
     schema_path: str,
@@ -681,12 +798,17 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    dataset_split_mode: str = 'none',
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    ``dataset_split_mode='none'`` keeps the baseline behavior: validation is
+    the last ``valid_ratio`` fraction of Row Groups in file order.
+
+    ``dataset_split_mode='timestamp'`` first scans only the ``timestamp``
+    column, sorts all rows by timestamp, and uses the latest ``valid_ratio``
+    fraction as validation. Full feature columns are read only afterwards.
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -706,19 +828,41 @@ def get_pcvr_data(
             rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
     total_rgs = len(rg_info)
 
-    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
+    if dataset_split_mode not in ('none', 'timestamp'):
+        raise ValueError(
+            f"Unknown dataset_split_mode={dataset_split_mode!r}; "
+            "expected 'none' or 'timestamp'")
 
-    # train_ratio: use only the first N% of the training Row Groups.
-    if train_ratio < 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+    train_row_indices_map = None
+    valid_row_indices_map = None
 
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+    if dataset_split_mode == 'timestamp':
+        logging.info("Building timestamp-based row-level train/valid split")
+        train_row_indices_map, valid_row_indices_map, train_rows, valid_rows = (
+            _build_timestamp_split_row_indices(
+                rg_info=rg_info,
+                valid_ratio=valid_ratio,
+                train_ratio=train_ratio,
+            )
+        )
+        train_row_group_range = None
+        valid_row_group_range = None
+    else:
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
 
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
+        # train_ratio: use only the first N% of the training Row Groups.
+        if train_ratio < 1.0:
+            n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+            logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+        train_row_group_range = (0, n_train_rgs)
+        valid_row_group_range = (n_train_rgs, total_rgs)
+
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
 
     train_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -727,7 +871,8 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
+        row_group_range=train_row_group_range,
+        row_indices_map=train_row_indices_map,
         clip_vocab=clip_vocab,
     )
 
@@ -749,7 +894,8 @@ def get_pcvr_data(
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
+        row_group_range=valid_row_group_range,
+        row_indices_map=valid_row_indices_map,
         clip_vocab=clip_vocab,
     )
     valid_loader = DataLoader(
@@ -757,7 +903,8 @@ def get_pcvr_data(
         num_workers=0, pin_memory=use_cuda,
     )
 
-    logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
+    logging.info(f"Parquet split_mode={dataset_split_mode}: "
+                 f"train: {train_rows} rows, valid: {valid_rows} rows, "
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset
