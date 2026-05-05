@@ -12,6 +12,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --dataset_split_mode timestamp \
+    --loss_type focal \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

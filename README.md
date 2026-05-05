@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 ### 特征分析
 
 | Category                 | Count | Dateset                 | Description                                                  |

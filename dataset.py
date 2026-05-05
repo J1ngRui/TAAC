@@ -346,11 +346,16 @@ class PCVRParquetDataset(IterableDataset):
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
         if self._row_indices_map is not None:
-            return sum(
-                (len(self._row_indices_map[(f, i)]) + self.batch_size - 1)
-                // self.batch_size
-                for f, i, _ in self._rg_list
-            )
+            total = 0
+            for f, i, n in self._rg_list:
+                selected_rows = self._row_indices_map[(f, i)]
+                for start in range(0, n, self.batch_size):
+                    end = min(start + self.batch_size, n)
+                    left = np.searchsorted(selected_rows, start, side='left')
+                    right = np.searchsorted(selected_rows, end, side='left')
+                    if right > left:
+                        total += 1
+            return total
         return sum((n + self.batch_size - 1) // self.batch_size
                    for _, _, n in self._rg_list)
 
