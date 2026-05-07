@@ -187,16 +187,18 @@ def parse_args() -> argparse.Namespace:
 
     # NS tokenizer variant.
     parser.add_argument('--ns_tokenizer_type', type=str, default='rankmixer',
-                        choices=['group', 'rankmixer'],
+                        choices=['group', 'rankmixer', 'hybrid'],
                         help='NS tokenizer variant: '
                              'group = project each group to one token, '
                              'rankmixer = concatenate all embeddings then split into '
-                             'equal-size chunks (token count is tunable)')
+                             'equal-size chunks, '
+                             'hybrid = project semantic groups then compress to '
+                             'a tunable token count')
     parser.add_argument('--user_ns_tokens', type=int, default=0,
-                        help='Number of user NS tokens in rankmixer mode '
+                        help='Number of user NS tokens in rankmixer/hybrid mode '
                              '(0 = automatically use the number of user groups)')
     parser.add_argument('--item_ns_tokens', type=int, default=0,
-                        help='Number of item NS tokens in rankmixer mode '
+                        help='Number of item NS tokens in rankmixer/hybrid mode '
                              '(0 = automatically use the number of item groups)')
 
     args = parser.parse_args()

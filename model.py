@@ -1189,6 +1189,81 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class HybridNSTokenizer(nn.Module):
+    """Semantic-group tokenizer with learnable compression to fixed token count.
+
+    First builds one token per configured semantic group using
+    :class:`GroupNSTokenizer`, then softly aggregates those group tokens into a
+    fixed number of NS tokens. This keeps the ns_groups.json boundary meaningful
+    while still letting the caller choose a RankMixer-friendly token count.
+    """
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        num_ns_tokens: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        if num_ns_tokens <= 0:
+            num_ns_tokens = len(groups)
+
+        self.group_tokenizer = GroupNSTokenizer(
+            feature_specs=feature_specs,
+            groups=groups,
+            emb_dim=emb_dim,
+            d_model=d_model,
+            emb_skip_threshold=emb_skip_threshold,
+        )
+        self.num_ns_tokens = num_ns_tokens
+        self.num_groups = len(groups)
+
+        # Compatibility aliases used by initialization / sparse reinit code.
+        self.feature_specs = self.group_tokenizer.feature_specs
+        self.groups = self.group_tokenizer.groups
+        self.emb_dim = self.group_tokenizer.emb_dim
+        self.emb_skip_threshold = self.group_tokenizer.emb_skip_threshold
+        self.embs = self.group_tokenizer.embs
+        self._emb_index = self.group_tokenizer._emb_index
+
+        self.mix_logits = nn.Parameter(torch.empty(num_ns_tokens, self.num_groups))
+        self.ffn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+        self._init_mix_logits()
+
+        logging.info(
+            f"HybridNSTokenizer: {self.num_groups} semantic groups -> "
+            f"{num_ns_tokens} NS tokens"
+        )
+
+    def _init_mix_logits(self) -> None:
+        """Initialize compression as near-contiguous semantic partitions."""
+        with torch.no_grad():
+            self.mix_logits.fill_(-2.0)
+            for group_idx in range(self.num_groups):
+                token_idx = min(
+                    self.num_ns_tokens - 1,
+                    group_idx * self.num_ns_tokens // max(1, self.num_groups),
+                )
+                self.mix_logits[token_idx, group_idx] = 2.0
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Build semantic group tokens, then compress them to fixed NS tokens."""
+        group_tokens = self.group_tokenizer(int_feats)  # (B, G, D)
+        weights = F.softmax(self.mix_logits, dim=-1)  # (K, G)
+        tokens = torch.einsum('kg,bgd->bkd', weights, group_tokens)
+        tokens = tokens + self.ffn(self.ffn_norm(tokens))
+        return self.out_norm(tokens)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1284,6 +1359,32 @@ class PCVRHyFormer(nn.Module):
             num_user_ns = user_ns_tokens
 
             self.item_ns_tokenizer = RankMixerNSTokenizer(
+                feature_specs=item_int_feature_specs,
+                groups=item_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_ns_tokens=item_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_item_ns = item_ns_tokens
+        elif ns_tokenizer_type == 'hybrid':
+            # Semantic groups first, then compress to a fixed token count.
+            # 0 means auto: fall back to group count.
+            if user_ns_tokens <= 0:
+                user_ns_tokens = len(user_ns_groups)
+            if item_ns_tokens <= 0:
+                item_ns_tokens = len(item_ns_groups)
+            self.user_ns_tokenizer = HybridNSTokenizer(
+                feature_specs=user_int_feature_specs,
+                groups=user_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_ns_tokens=user_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_user_ns = user_ns_tokens
+
+            self.item_ns_tokenizer = HybridNSTokenizer(
                 feature_specs=item_int_feature_specs,
                 groups=item_ns_groups,
                 emb_dim=emb_dim,
