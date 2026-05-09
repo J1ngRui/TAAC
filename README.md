@@ -299,6 +299,55 @@ anchor_delta 只作为趋势残差注入。
 
 
 
+```text
+Stage8｜TS5：Conflict-Downweighted BCE
+结构：baseline + group + time context + fixed early anchor delta
+在 TS4 的时间上下文结构基础上，不继续加大全局 dropout，
+而是在 loss 层对极端 label/prediction 冲突样本做局部降权。
+
+动机：
+当前训练中 logloss 和 loss 一直存在震荡。
+继续依赖 dropout 会全局削弱模型表达，尤其会同时影响正常样本和有效模式；
+但震荡更可能来自少量极端冲突样本对 BCE 梯度的放大。
+
+TS5 的目标不是让模型整体变弱，
+而是只降低“当前预测极度自信但与 label 相反”的样本对单步更新的影响，
+让主体样本继续按 BCE 正常学习。
+
+loss 定义：
+先计算逐样本 BCEWithLogits：
+
+loss_raw = BCEWithLogits(logits, label, reduction="none")
+
+再根据当前预测概率识别极端冲突样本：
+
+pos_conflict = (label == 1) & (sigmoid(logits) < 0.05)
+neg_conflict = (label == 0) & (sigmoid(logits) > 0.95)
+
+这些样本的 loss weight 从 1.0 降到 0.2：
+
+loss = sum(loss_raw * weight) / sum(weight)
+
+实验开关：
+--loss_type conflict_bce
+--conflict_pos_prob_threshold 0.05
+--conflict_neg_prob_threshold 0.95
+--conflict_weight 0.2
+
+当前定位：
+TS5 是 TS4 之后的 loss-stabilization 主线。
+它保留 TS4 的 time context + anchor_delta residual，
+只改变训练目标的样本加权方式，不改变模型结构和推理路径。
+
+评估注意：
+validation logloss 仍然使用标准 BCEWithLogits 计算，
+因此 TS5 的 valid logloss 可以和之前实验直接比较。
+如果 TS5 有效，预期现象应该是训练 loss/logloss 震荡减弱，
+同时 valid/test gap 不因继续增大 dropout 而被动扩大。
+```
+
+
+
 
 
 
