@@ -78,11 +78,6 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
-    parser.add_argument('--dataset_split_mode', type=str, default='none',
-                        choices=['none', 'timestamp'],
-                        help='Dataset split mode: none = baseline Row Group split; '
-                             'timestamp = sort rows by timestamp and use the latest '
-                             'valid_ratio fraction for validation')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -128,6 +123,11 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--use_time_context', action='store_true', default=False,
+                        help='Add a current-time NS token from timestamp cyclic features')
+    parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
+                        help='Timezone offset used for timestamp cyclic features '
+                             '(default: 8.0 for UTC+8)')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -256,7 +256,6 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
-        dataset_split_mode=args.dataset_split_mode,
     )
 
     # ---- NS groups ----
@@ -306,6 +305,8 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
+        "use_time_context": args.use_time_context,
+        "time_context_tz_offset_hours": args.time_context_tz_offset_hours,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,

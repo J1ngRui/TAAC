@@ -13,6 +13,7 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    timestamp: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
@@ -326,7 +327,7 @@ class RankMixerBlock(nn.Module):
     def __init__(
         self,
         d_model: int,
-        n_total: int,  # T = Nq + Nns
+        n_total: int,  # Total mixed tokens: num_queries * num_sequences + num_ns
         hidden_mult: int = 4,
         dropout: float = 0.0,
         mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
@@ -385,7 +386,7 @@ class RankMixerBlock(nn.Module):
         """Applies query boosting: token mixing, FFN, and residual connection.
 
         Args:
-            Q: (B, T, D) where T = Nq + Nns.
+            Q: (B, T, D) where T is all Q tokens plus all NS tokens.
 
         Returns:
             Boosted tensor of shape (B, T, D).
@@ -1300,6 +1301,8 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        use_time_context: bool = False,
+        time_context_tz_offset_hours: float = 8.0,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1318,6 +1321,8 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+        self.use_time_context = use_time_context
+        self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1412,9 +1417,18 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        if self.use_time_context:
+            self.time_context_proj = nn.Sequential(
+                nn.Linear(4, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+                nn.Dropout(dropout_rate)
+            )
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.use_time_context else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1682,6 +1696,50 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _build_time_context_features(self, timestamp: torch.Tensor) -> torch.Tensor:
+        """Build cyclic current-time features from Unix-second timestamps.
+
+        Features are sin/cos for local second-of-day and local day-of-week.
+        ``time_context_tz_offset_hours`` shifts Unix UTC seconds to the desired
+        business timezone before extracting the cycles.
+        """
+        ts = timestamp.to(dtype=torch.float32)
+        local_ts = ts + float(self.time_context_tz_offset_hours) * 3600.0
+        seconds_per_day = 86400.0
+        seconds_of_day = torch.remainder(local_ts, seconds_per_day)
+        day_index = torch.floor(local_ts / seconds_per_day)
+        day_of_week = torch.remainder(day_index + 3.0, 7.0)
+
+        two_pi = 2.0 * math.pi
+        day_angle = seconds_of_day / seconds_per_day * two_pi
+        week_angle = day_of_week / 7.0 * two_pi
+        return torch.stack([
+            torch.sin(day_angle),
+            torch.cos(day_angle),
+            torch.sin(week_angle),
+            torch.cos(week_angle),
+        ], dim=-1)
+
+    def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
+        """Build all non-sequence tokens, including optional time context."""
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+
+        ns_parts = [user_ns]
+        if self.has_user_dense:
+            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            ns_parts.append(user_dense_tok)
+        ns_parts.append(item_ns)
+        if self.has_item_dense:
+            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            ns_parts.append(item_dense_tok)
+        if self.use_time_context:
+            time_feats = self._build_time_context_features(inputs.timestamp)
+            time_context_tok = self.time_context_proj(time_feats).unsqueeze(1)
+            ns_parts.append(time_context_tok)
+
+        return torch.cat(ns_parts, dim=1)
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1734,20 +1792,8 @@ class PCVRHyFormer(nn.Module):
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        # 1. NS tokens: user/item/dense context plus optional current-time token.
+        ns_tokens = self._build_ns_tokens(inputs)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1777,20 +1823,7 @@ class PCVRHyFormer(nn.Module):
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
-        # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
+        ns_tokens = self._build_ns_tokens(inputs)
 
         seq_tokens_list = []
         seq_masks_list = []

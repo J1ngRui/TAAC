@@ -2,28 +2,17 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: semantic NS groups compressed to fixed NS tokens ----
+# ---- Active config: one token per semantic group + current-time context ----
 python3 -u "${SCRIPT_DIR}/train.py" \
-    --ns_tokenizer_type hybrid \
+    --ns_tokenizer_type group \
     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
-    --user_ns_tokens 5 \
-    --item_ns_tokens 2 \
     --num_queries 2 \
+    --use_time_context \
+    --time_context_tz_offset_hours 8 \
+    --d_model 84 \
+    --rank_mixer_mode full \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
-    --loss_type focal \
+    --loss_type bce \
+    --dropout_rate 0.05 \
     "$@"
-
-# ---- Alternative config: one token per semantic group ----
-# Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).
-# With d_model=64 and num_ns=12 (7 user_int + 1 user_dense + 4 item_int),
-# num_queries=1 satisfies d_model % T == 0 (T = num_queries*4 + num_ns).
-# To switch, comment out the block above and uncomment the block below.
-#
-# python3 -u "${SCRIPT_DIR}/train.py" \
-#     --ns_tokenizer_type group \
-#     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
-#     --num_queries 1 \
-#     --emb_skip_threshold 1000000 \
-#     --num_workers 8 \
-#     "$@"
