@@ -4,7 +4,7 @@ import copy
 import logging
 import time
 from datetime import timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import torch
@@ -313,3 +313,70 @@ def conflict_downweighted_bce_loss(
         weight[conflict_mask] = conflict_weight
 
     return (loss_raw * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def loss_bucket_downweighted_bce_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    medium_loss_threshold: float = 0.5,
+    high_loss_threshold: float = 1.0,
+    medium_loss_weight: float = 0.5,
+    high_loss_weight: float = 0.2,
+) -> torch.Tensor:
+    """BCEWithLogits with per-sample loss buckets downweighted."""
+    targets = targets.float().view_as(logits)
+    loss_raw = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction='none',
+    )
+
+    with torch.no_grad():
+        weight = torch.ones_like(targets)
+        medium_mask = (loss_raw > medium_loss_threshold) & (loss_raw <= high_loss_threshold)
+        high_mask = loss_raw > high_loss_threshold
+        weight[medium_mask] = medium_loss_weight
+        weight[high_mask] = high_loss_weight
+
+    return (loss_raw * weight).sum() / weight.sum().clamp_min(1.0)
+
+
+def weighted_bce_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    start_loss: float = 0.45,
+    end_loss: float = 1.0,
+    min_weight: float = 0.2,
+    return_stats: bool = False,
+) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+    """BCEWithLogits with linear high-loss downweighting.
+
+    Samples at or below ``start_loss`` keep weight 1.0. Samples from
+    ``start_loss`` to ``end_loss`` are linearly annealed down to
+    ``min_weight``. Samples at or above ``end_loss`` use ``min_weight``.
+    """
+    if end_loss <= start_loss:
+        raise ValueError("end_loss must be greater than start_loss")
+
+    targets = targets.float().view_as(logits)
+    loss_raw = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction='none',
+    )
+
+    with torch.no_grad():
+        loss_detach = loss_raw.detach()
+        t = ((loss_detach - start_loss) / (end_loss - start_loss)).clamp(0.0, 1.0)
+        weight = 1.0 - t * (1.0 - min_weight)
+
+        stats: Optional[Dict[str, float]] = None
+        if return_stats:
+            stats = {
+                'reweight_ratio': (loss_detach > start_loss).float().mean().item(),
+                'strong_ratio': (loss_detach >= end_loss).float().mean().item(),
+                'avg_weight': weight.mean().item(),
+            }
+
+    loss = (loss_raw * weight).sum() / weight.sum().clamp_min(1.0)
+    return loss, stats

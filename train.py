@@ -152,9 +152,18 @@ def parse_args() -> argparse.Namespace:
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce',
-                        choices=['bce', 'focal', 'conflict_bce'],
+                        choices=[
+                            'bce',
+                            'focal',
+                            'conflict_bce',
+                            'loss_bucket_bce',
+                            'weighted_bce',
+                        ],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
-                             'conflict_bce = BCE with extreme conflicts downweighted')
+                             'conflict_bce = BCE with extreme probability conflicts downweighted, '
+                             'loss_bucket_bce = BCE with high-loss samples downweighted, '
+                             'weighted_bce = BCE with linear high-loss reweighting '
+                             'after warmup')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
@@ -170,6 +179,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--conflict_weight', type=float, default=0.2,
                         help='Weight assigned to extreme conflict samples '
                              '(effective only when --loss_type=conflict_bce)')
+    parser.add_argument('--loss_bucket_medium_threshold', type=float, default=0.5,
+                        help='Samples with per-example BCE above this threshold and at or '
+                             'below --loss_bucket_high_threshold receive medium weight '
+                             '(effective only when --loss_type=loss_bucket_bce)')
+    parser.add_argument('--loss_bucket_high_threshold', type=float, default=1.0,
+                        help='Samples with per-example BCE above this threshold receive '
+                             'high-loss weight (effective only when --loss_type=loss_bucket_bce)')
+    parser.add_argument('--loss_bucket_medium_weight', type=float, default=0.5,
+                        help='Weight for medium-loss samples '
+                             '(effective only when --loss_type=loss_bucket_bce)')
+    parser.add_argument('--loss_bucket_high_weight', type=float, default=0.2,
+                        help='Weight for high-loss samples '
+                             '(effective only when --loss_type=loss_bucket_bce)')
+    parser.add_argument('--linear_reweight_start_loss', type=float, default=0.45,
+                        help='Per-example BCE where linear reweighting starts '
+                             '(effective only when --loss_type=weighted_bce)')
+    parser.add_argument('--linear_reweight_end_loss', type=float, default=1.0,
+                        help='Per-example BCE where linear reweighting reaches min weight '
+                             '(effective only when --loss_type=weighted_bce)')
+    parser.add_argument('--linear_reweight_min_weight', type=float, default=0.2,
+                        help='Minimum sample weight for linear high-loss reweighting '
+                             '(effective only when --loss_type=weighted_bce)')
+    parser.add_argument('--linear_reweight_start_epoch', type=int, default=3,
+                        help='First epoch that enables linear high-loss reweighting '
+                             '(effective only when --loss_type=weighted_bce)')
+    parser.add_argument('--linear_reweight_log_every_n_steps', type=int, default=100,
+                        help='Print linear reweight stats every N training steps '
+                             '(0 = disable; effective only when linear reweighting is active)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -391,6 +428,15 @@ def main() -> None:
         conflict_pos_prob_threshold=args.conflict_pos_prob_threshold,
         conflict_neg_prob_threshold=args.conflict_neg_prob_threshold,
         conflict_weight=args.conflict_weight,
+        loss_bucket_medium_threshold=args.loss_bucket_medium_threshold,
+        loss_bucket_high_threshold=args.loss_bucket_high_threshold,
+        loss_bucket_medium_weight=args.loss_bucket_medium_weight,
+        loss_bucket_high_weight=args.loss_bucket_high_weight,
+        linear_reweight_start_loss=args.linear_reweight_start_loss,
+        linear_reweight_end_loss=args.linear_reweight_end_loss,
+        linear_reweight_min_weight=args.linear_reweight_min_weight,
+        linear_reweight_start_epoch=args.linear_reweight_start_epoch,
+        linear_reweight_log_every_n_steps=args.linear_reweight_log_every_n_steps,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,

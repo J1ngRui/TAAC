@@ -18,7 +18,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import conflict_downweighted_bce_loss, sigmoid_focal_loss, EarlyStopping
+from utils import (
+    conflict_downweighted_bce_loss,
+    loss_bucket_downweighted_bce_loss,
+    sigmoid_focal_loss,
+    weighted_bce_loss,
+    EarlyStopping,
+)
 from model import ModelInput
 
 
@@ -51,6 +57,15 @@ class PCVRHyFormerRankingTrainer:
         conflict_pos_prob_threshold: float = 0.05,
         conflict_neg_prob_threshold: float = 0.95,
         conflict_weight: float = 0.2,
+        loss_bucket_medium_threshold: float = 0.5,
+        loss_bucket_high_threshold: float = 1.0,
+        loss_bucket_medium_weight: float = 0.5,
+        loss_bucket_high_weight: float = 0.2,
+        linear_reweight_start_loss: float = 0.45,
+        linear_reweight_end_loss: float = 1.0,
+        linear_reweight_min_weight: float = 0.2,
+        linear_reweight_start_epoch: int = 3,
+        linear_reweight_log_every_n_steps: int = 100,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -106,6 +121,15 @@ class PCVRHyFormerRankingTrainer:
         self.conflict_pos_prob_threshold: float = conflict_pos_prob_threshold
         self.conflict_neg_prob_threshold: float = conflict_neg_prob_threshold
         self.conflict_weight: float = conflict_weight
+        self.loss_bucket_medium_threshold: float = loss_bucket_medium_threshold
+        self.loss_bucket_high_threshold: float = loss_bucket_high_threshold
+        self.loss_bucket_medium_weight: float = loss_bucket_medium_weight
+        self.loss_bucket_high_weight: float = loss_bucket_high_weight
+        self.linear_reweight_start_loss: float = linear_reweight_start_loss
+        self.linear_reweight_end_loss: float = linear_reweight_end_loss
+        self.linear_reweight_min_weight: float = linear_reweight_min_weight
+        self.linear_reweight_start_epoch: int = linear_reweight_start_epoch
+        self.linear_reweight_log_every_n_steps: int = linear_reweight_log_every_n_steps
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -119,6 +143,14 @@ class PCVRHyFormerRankingTrainer:
                      f"conflict_pos_prob_threshold={conflict_pos_prob_threshold}, "
                      f"conflict_neg_prob_threshold={conflict_neg_prob_threshold}, "
                      f"conflict_weight={conflict_weight}, "
+                     f"loss_bucket_medium_threshold={loss_bucket_medium_threshold}, "
+                     f"loss_bucket_high_threshold={loss_bucket_high_threshold}, "
+                     f"loss_bucket_medium_weight={loss_bucket_medium_weight}, "
+                     f"loss_bucket_high_weight={loss_bucket_high_weight}, "
+                     f"linear_reweight_start_loss={linear_reweight_start_loss}, "
+                     f"linear_reweight_end_loss={linear_reweight_end_loss}, "
+                     f"linear_reweight_min_weight={linear_reweight_min_weight}, "
+                     f"linear_reweight_start_epoch={linear_reweight_start_epoch}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
@@ -310,7 +342,7 @@ class PCVRHyFormerRankingTrainer:
             loss_sum = 0.0
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
+                loss = self._train_step(batch, epoch=epoch, total_step=total_step)
                 total_step += 1
                 loss_sum += loss
 
@@ -409,7 +441,7 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
         )
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
+    def _train_step(self, batch: Dict[str, Any], epoch: int, total_step: int) -> float:
         """Run a single training step and return the scalar loss value."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
@@ -432,6 +464,41 @@ class PCVRHyFormerRankingTrainer:
                 neg_prob_threshold=self.conflict_neg_prob_threshold,
                 conflict_weight=self.conflict_weight,
             )
+        elif self.loss_type == 'loss_bucket_bce':
+            loss = loss_bucket_downweighted_bce_loss(
+                logits,
+                label,
+                medium_loss_threshold=self.loss_bucket_medium_threshold,
+                high_loss_threshold=self.loss_bucket_high_threshold,
+                medium_loss_weight=self.loss_bucket_medium_weight,
+                high_loss_weight=self.loss_bucket_high_weight,
+            )
+        elif self.loss_type == 'weighted_bce':
+            if epoch >= self.linear_reweight_start_epoch:
+                current_step = total_step + 1
+                log_stats = (
+                    self.linear_reweight_log_every_n_steps > 0
+                    and current_step % self.linear_reweight_log_every_n_steps == 0
+                )
+                loss, stats = weighted_bce_loss(
+                    logits,
+                    label,
+                    start_loss=self.linear_reweight_start_loss,
+                    end_loss=self.linear_reweight_end_loss,
+                    min_weight=self.linear_reweight_min_weight,
+                    return_stats=log_stats,
+                )
+                if stats is not None:
+                    print(
+                        f"[loss linear reweight] "
+                        f"loss>{self.linear_reweight_start_loss}: "
+                        f"{stats['reweight_ratio']:.4%}, "
+                        f"loss>={self.linear_reweight_end_loss}: "
+                        f"{stats['strong_ratio']:.4%}, "
+                        f"avg_weight: {stats['avg_weight']:.4f}"
+                    )
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
