@@ -144,10 +144,10 @@ TS3 的目标是让 time context 表达更细，不只告诉模型“现在是�
 
 
 ```text
-Stage5｜TS2 + Regularization：回到 TS2 做泛化增强
+Stage5｜ts2_dropout1：TS2 + Time Context Dropout
 结构：
 baseline + group + time context + remove hybrid
-在 TS2 基础上增加正则项。
+在 TS2 基础上增加 time context dropout。
 
 动机：
 TS2 相比 TS1：
@@ -171,8 +171,130 @@ time context 是当前增益核心，也是最可能导致过拟合的强特征�
 先对 time token 做轻量正则，风险最低。
 
 结论：
-TS2_regularized 是当前最值得继续跑的主线。
+ts2_dropout1 是当前正在跑的主线。
 目标不是让 valid 继续变高，而是让 test 回到甚至超过 TS1 的 0.8213
+```
+
+
+
+```text
+Stage6｜Time Shift Generalization：时间偏移视角下的泛化增强
+结构：
+baseline + group + time context
+在 ts2_dropout1 的基础上，继续围绕时间偏移/泛化能力做增强。
+
+核心假设：
+valid/test gap 不一定只是传统意义上的数据分布问题；
+更可能是 valid 中可被模型拟合的信息，和 test 真正需要的泛化信息之间存在 gap。
+
+也就是说：
+valid 可能包含更多同窗口、同分布、局部 pattern 或短期记忆信号；
+模型容量变强后，这些信号会抬高 valid；
+但这些信息到 test 上不稳定，导致 test 不同步上涨。
+
+对 timestamp 的重新理解：
+timestamp / time context 的价值，不只是告诉模型“样本发生在什么时间”；
+更重要的是引入一个时间偏移视角，让模型意识到 train -> valid/test 之间存在时间状态变化。
+
+因此 time context 可能起到两层作用：
+1. 提供周期性上下文，例如日内、周内行为差异；
+2. 作为 temporal shift indicator，帮助模型减少对局部记忆信号的依赖，提升跨时间泛化。
+
+下一步实验：
+在保留 ts2_dropout1 的 dropout 设定下，增强 time context 的表达，
+重点不是继续增加模型容量，而是更明确地表达时间偏移和时间状态。
+
+候选方向：
+- 加入绝对/相对时间趋势特征，弥补当前 sin-cos 只表达周期、不表达整体时间漂移的问题；
+- 保留 day/week sin-cos 周期特征；
+- 可尝试加入 coarse time bucket / normalized timestamp rank / weekend flag 等低维特征；
+- 暂时不要同时给所有其他 token generator 加 dropout，避免变量混在一起。
+
+目标：
+验证 gap 缩小是否来自 time context 对 temporal shift 的建模，
+而不仅是普通正则或数据切分变化。
+```
+
+
+
+```text
+Stage7｜TS4：Fixed Early Anchor Time Delta
+结构：
+baseline + group + enhanced time context
+在原有 time context 的周期特征基础上，加入一个相对于训练早期锚点的时间推进特征。
+
+核心动机：
+前面的 norm_time / after_train 思路存在一个问题：
+如果 test 整体都晚于 train，模型在训练阶段可能没有足够监督来学习“越界之后应该怎么处理”。
+
+Fixed Early Anchor 的做法不是使用 test 统计，也不是构造不可训练的未来越界特征；
+而是在训练集中选一个固定早期时间锚点 anchor_ts，
+让所有样本都能得到一个从训练早期开始累计推进的连续时间距离。
+
+anchor_ts 定义：
+不直接使用训练集最小 timestamp，避免极端 outlier。
+使用训练集 timestamp 的低分位点，例如 p01：
+
+anchor_ts = percentile(train_timestamps, 1)
+
+anchor_delta 定义：
+delta_t = max(timestamp - anchor_ts, 0)
+anchor_delta = log1p(delta_t / 86400)
+
+其中 anchor_delta 表示当前样本相对于训练早期固定锚点的天级推进距离。
+log1p 用于压缩秒级 timestamp 带来的大尺度差异，使该特征更平滑、更容易训练。
+
+建模方式：
+原有 time context 仍保留 4 个周期特征：
+day_sin, day_cos, week_sin, week_cos
+
+这 4 个周期特征先经过原来的 time projection 转换；
+anchor_delta 单独经过一个小的 embedding/projection 得到 anchor_delta embedding；
+然后将二者 concat：
+
+cyclic_time_feat = proj([day_sin, day_cos, week_sin, week_cos])
+anchor_delta_emb = anchor_delta_proj(anchor_delta)
+time_feat = GELU(Linear(concat(cyclic_time_feat, anchor_delta_emb)))
+
+最终 time_feat 仍作为 1 个 time context NS token 拼入 user/item/dense NS tokens 后面。
+
+预期作用：
+1. 周期特征负责表达日内/周内行为周期；
+2. anchor_delta 负责表达样本距离训练早期锚点的时间推进程度；
+3. 模型可以自行学习：当样本时间推进更远时，哪些局部 pattern / group token / item 信号应该降低依赖。
+
+优势：
+- 只依赖 train timestamp 统计，不使用 test 统计；
+- 训练集中所有样本都有 anchor_delta，不像 after_train 那样大部分为 0；
+- 相比绝对 timestamp，anchor_delta 更稳定、尺度更合理；
+- 相比单纯周期 sin-cos，能表达随时间移动的动态趋势。
+
+当前定位：
+TS4 是 ts2_dropout1 之后的 enhanced time 主线。
+如果 ts2_dropout1 证明 dropout 能缩小 valid/test gap，
+下一步用 Fixed Early Anchor Time Delta 验证 gap 是否还能通过时间趋势建模进一步缩小。
+
+实现开关：
+只保留一个实验开关：
+--time_context_use_anchor_delta
+
+关闭时：保持当前 ts2_dropout1 的 cyclic time context，不改变原有 time token 生成逻辑。
+开启时：训练阶段只用 train timestamp 抽样估计 anchor_ts，并启用 anchor_delta residual 分支。
+
+anchor_ts 不是手动实验开关，而是训练时统计出来的运行参数：
+sample 5% train Row Groups -> timestamp p01 -> 写入 train_config.json。
+推理时必须复用 train_config.json 中保存的 anchor_ts，不能重新用 valid/test 统计。
+
+残差结构：
+cyclic_tok = time_context_proj([day_sin, day_cos, week_sin, week_cos])
+anchor_tok = time_anchor_delta_proj(anchor_delta)
+anchor_alpha = learnable scalar, initialized to 0.1
+time_tok = cyclic_tok + anchor_alpha * anchor_tok
+
+这样原来的周期 time feature 不会被二次 concat/fuse 压缩；
+anchor_delta 只作为趋势残差注入。
+初始阶段 anchor 分支影响较小，模型先沿用 TS2 的周期 time context，
+再通过训练自行决定 anchor_delta 应该加多强。
 ```
 
 

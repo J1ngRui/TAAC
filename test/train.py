@@ -19,12 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import (
-    FeatureSchema,
-    get_pcvr_data,
-    estimate_timestamp_anchor,
-    NUM_TIME_BUCKETS,
-)
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -133,12 +128,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
                         help='Timezone offset used for timestamp cyclic features '
                              '(default: 8.0 for UTC+8)')
-    parser.add_argument('--time_context_use_anchor_delta', action='store_true', default=False,
-                        help='Add a residual log-days-since-anchor branch to the time context token')
-    parser.add_argument('--time_context_anchor_sample_ratio', type=float, default=0.05,
-                        help='Fraction of train Row Groups sampled when estimating time_context_anchor_ts')
-    parser.add_argument('--time_context_anchor_percentile', type=float, default=1.0,
-                        help='Train timestamp percentile used as the fixed early anchor')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -269,21 +258,6 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
     )
 
-    if args.time_context_use_anchor_delta:
-        if not args.use_time_context:
-            raise ValueError("--time_context_use_anchor_delta requires --use_time_context")
-        args.time_context_anchor_ts = estimate_timestamp_anchor(
-            pcvr_dataset,
-            sample_ratio=args.time_context_anchor_sample_ratio,
-            percentile=args.time_context_anchor_percentile,
-            seed=args.seed,
-        )
-        logging.info(
-            f"Using time_context_anchor_ts={args.time_context_anchor_ts:.3f} "
-            f"(anchor_delta enabled)")
-    else:
-        args.time_context_anchor_ts = 0.0
-
     # ---- NS groups ----
     if args.ns_groups_json and os.path.exists(args.ns_groups_json):
         logging.info(f"Loading NS groups from {args.ns_groups_json}")
@@ -333,8 +307,6 @@ def main() -> None:
         "seq_id_threshold": args.seq_id_threshold,
         "use_time_context": args.use_time_context,
         "time_context_tz_offset_hours": args.time_context_tz_offset_hours,
-        "time_context_use_anchor_delta": args.time_context_use_anchor_delta,
-        "time_context_anchor_ts": args.time_context_anchor_ts,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
