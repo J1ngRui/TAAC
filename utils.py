@@ -286,3 +286,30 @@ def sigmoid_focal_loss(
     elif reduction == 'sum':
         return loss.sum()
     return loss
+
+
+def conflict_downweighted_bce_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pos_prob_threshold: float = 0.05,
+    neg_prob_threshold: float = 0.95,
+    conflict_weight: float = 0.2,
+) -> torch.Tensor:
+    """BCEWithLogits with extreme label/prediction conflicts downweighted."""
+    targets = targets.float().view_as(logits)
+    loss_raw = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        reduction='none',
+    )
+
+    with torch.no_grad():
+        prob = torch.sigmoid(logits)
+        pos_conflict = (targets == 1) & (prob < pos_prob_threshold)
+        neg_conflict = (targets == 0) & (prob > neg_prob_threshold)
+        conflict_mask = pos_conflict | neg_conflict
+
+        weight = torch.ones_like(targets)
+        weight[conflict_mask] = conflict_weight
+
+    return (loss_raw * weight).sum() / weight.sum().clamp_min(1.0)

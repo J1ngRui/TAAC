@@ -151,14 +151,25 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
+    parser.add_argument('--loss_type', type=str, default='bce',
+                        choices=['bce', 'focal', 'conflict_bce'],
+                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
+                             'conflict_bce = BCE with extreme conflicts downweighted')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--conflict_pos_prob_threshold', type=float, default=0.05,
+                        help='Downweight positive labels when sigmoid(logit) is below '
+                             'this threshold (effective only when --loss_type=conflict_bce)')
+    parser.add_argument('--conflict_neg_prob_threshold', type=float, default=0.95,
+                        help='Downweight negative labels when sigmoid(logit) is above '
+                             'this threshold (effective only when --loss_type=conflict_bce)')
+    parser.add_argument('--conflict_weight', type=float, default=0.2,
+                        help='Weight assigned to extreme conflict samples '
+                             '(effective only when --loss_type=conflict_bce)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -377,6 +388,9 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        conflict_pos_prob_threshold=args.conflict_pos_prob_threshold,
+        conflict_neg_prob_threshold=args.conflict_neg_prob_threshold,
+        conflict_weight=args.conflict_weight,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,

@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import conflict_downweighted_bce_loss, sigmoid_focal_loss, EarlyStopping
 from model import ModelInput
 
 
@@ -48,6 +48,9 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        conflict_pos_prob_threshold: float = 0.05,
+        conflict_neg_prob_threshold: float = 0.95,
+        conflict_weight: float = 0.2,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -100,6 +103,9 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.conflict_pos_prob_threshold: float = conflict_pos_prob_threshold
+        self.conflict_neg_prob_threshold: float = conflict_neg_prob_threshold
+        self.conflict_weight: float = conflict_weight
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -110,6 +116,9 @@ class PCVRHyFormerRankingTrainer:
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                     f"conflict_pos_prob_threshold={conflict_pos_prob_threshold}, "
+                     f"conflict_neg_prob_threshold={conflict_neg_prob_threshold}, "
+                     f"conflict_weight={conflict_weight}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
@@ -415,6 +424,14 @@ class PCVRHyFormerRankingTrainer:
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        elif self.loss_type == 'conflict_bce':
+            loss = conflict_downweighted_bce_loss(
+                logits,
+                label,
+                pos_prob_threshold=self.conflict_pos_prob_threshold,
+                neg_prob_threshold=self.conflict_neg_prob_threshold,
+                conflict_weight=self.conflict_weight,
+            )
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()

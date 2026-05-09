@@ -14,6 +14,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --rank_mixer_mode full \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
-    --loss_type bce \
+    --loss_type conflict_bce \
+    --conflict_pos_prob_threshold 0.05 \
+    --conflict_neg_prob_threshold 0.95 \
+    --conflict_weight 0.2 \
     --dropout_rate 0.01 \
     "$@"
