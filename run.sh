@@ -15,5 +15,5 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --loss_type bce \
-    --dropout_rate 0.05 \
+    --dropout_rate 0.02 \
     "$@"
