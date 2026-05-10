@@ -381,6 +381,57 @@ validation logloss 仍然使用标准 BCEWithLogits 计算，
 同时不需要通过继续增大 dropout 来压制异常梯度。
 ```
 
+```text
+Stage9｜Target Cate Match V1
+结构：baseline + group + cyclic time context + smooth weighted BCE + target cate match
+
+目标：
+给 target item 增加一组 target-aware history matching 特征。
+这里的 cate 表示与 target item_int_fid=13 对齐的历史 cate-like / semantic-id-like 离散特征，
+不假设其真实业务含义一定是类目，只利用其跨 target/history 的编码空间重叠关系。
+
+当前不使用 item_id / ID 类 repeat 特征，只保留 cate-like semantic matching 主线。
+这组特征会追加到 item_int_feats 末尾，并作为新的 I5_target_hist_match item NS group 接入；
+I1-I4 继续表示原始 target item 属性，I5 专门表示 target 与历史兴趣的匹配统计。
+
+当前根据字段 overlap 自动发现 target item 侧与历史行为侧可对齐的 item-side discrete semantic feature：
+target_cate_item_fid = 13
+seq_a history cate fid = 46
+seq_b history cate fid = 68
+seq_c history cate fid = 32
+seq_d history cate fid = 25
+
+该特征的价值不依赖人工语义命名：
+overlap 证明它和历史序列字段可对齐；
+可对齐就可以统计 target 与 history 的匹配强度；
+匹配强度本身就是用户兴趣相关信号。
+
+动态生成 4 个 synthetic item-int 特征：
+200001 target_cate_in_hist
+200002 target_cate_count_bucket
+200003 target_cate_ratio_bucket
+200004 target_cate_last_delta_bucket
+
+口径：
+只统计 sequence timestamp < 当前样本 timestamp 的历史行为。
+多路 sequence 会合并统计，但不生成 domain matching 特征。
+
+Bucket：
+target_cate_count_bucket: 0 / 1 / 2 / 3-5 / 6-10 / 10+
+target_cate_ratio_bucket: 0 / (0,0.1] / (0.1,0.3] / (0.3,0.5] / (0.5,1]
+target_cate_last_delta_bucket: never / <=1h / <=1d / <=7d / <=30d / >30d
+
+实验开关：
+--use_target_hist_match
+--target_hist_match_target_cate_item_fid 13
+--target_hist_match_cate_seq_fids seq_a:46,seq_b:68,seq_c:32,seq_d:25
+
+结构注意：
+新增 I5 后 num_ns + 1。
+当前 group + time_context 配置下 T 从 21 变成 22；
+RankMixer full 下 run.sh 使用 d_model=88，满足 88 % 22 == 0。
+```
+
 
 
 

@@ -14,7 +14,7 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -40,6 +40,49 @@ def build_feature_specs(
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
     return specs
+
+
+def parse_int_list(value: str) -> List[int]:
+    """Parse a comma-separated integer list."""
+    return [int(x.strip()) for x in value.split(',') if x.strip()]
+
+
+def parse_domain_fid_map(value: str) -> Dict[str, int]:
+    """Parse ``seq_a:46,seq_b:68`` into a domain->fid mapping."""
+    result: Dict[str, int] = {}
+    for pair in value.split(','):
+        if not pair.strip():
+            continue
+        domain, fid = pair.split(':')
+        result[domain.strip()] = int(fid.strip())
+    return result
+
+
+def build_target_hist_match_config(args: argparse.Namespace) -> Dict[str, object]:
+    """Build optional target-history matching config for the dataset."""
+    if not args.use_target_hist_match:
+        return {"enabled": False}
+
+    required = {
+        "target_hist_match_target_cate_item_fid": args.target_hist_match_target_cate_item_fid,
+        "target_hist_match_cate_seq_fids": args.target_hist_match_cate_seq_fids,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            "--use_target_hist_match requires: " + ", ".join(f"--{name}" for name in missing)
+        )
+
+    feature_fids = parse_int_list(args.target_hist_match_feature_fids)
+    if len(feature_fids) != 4:
+        raise ValueError("--target_hist_match_feature_fids must contain exactly 4 fids")
+
+    return {
+        "enabled": True,
+        "target_cate_item_fid": args.target_hist_match_target_cate_item_fid,
+        "hist_cate_seq_fids": parse_domain_fid_map(args.target_hist_match_cate_seq_fids),
+        "feature_fids": feature_fids,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,6 +175,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
                         help='Timezone offset used for timestamp cyclic features '
                              '(default: 8.0 for UTC+8)')
+    parser.add_argument('--use_target_hist_match', action='store_true', default=False,
+                        help='Append target-category/history-category matching bucket features '
+                             'as a dedicated item NS group')
+    parser.add_argument('--target_hist_match_target_cate_item_fid', type=int, default=None,
+                        help='Item-int fid containing target category ids '
+                             '(required by --use_target_hist_match)')
+    parser.add_argument('--target_hist_match_cate_seq_fids', type=str, default=None,
+                        help='Per-domain historical category fid mapping, e.g. '
+                             'seq_a:46,seq_b:68,seq_c:32,seq_d:25 '
+                             '(required by --use_target_hist_match)')
+    parser.add_argument('--target_hist_match_feature_fids', type=str,
+                        default='200001,200002,200003,200004',
+                        help='Synthetic item-int fids for target category matching '
+                             'features: cate_in_hist,cate_count_bucket,'
+                             'cate_ratio_bucket,cate_last_delta_bucket')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -297,6 +355,10 @@ def main() -> None:
             seq_max_lens[k.strip()] = int(v.strip())
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
+    target_hist_match_config = build_target_hist_match_config(args)
+    if target_hist_match_config.get("enabled", False):
+        logging.info(f"TargetHistMatchV1 enabled: {target_hist_match_config}")
+
     logging.info("Using Parquet data format (IterableDataset)")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
@@ -308,6 +370,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        target_hist_match_config=target_hist_match_config,
     )
 
     # ---- NS groups ----
@@ -324,7 +387,30 @@ def main() -> None:
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
         user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
-        item_ns_groups = [[i] for i in range(len(pcvr_dataset.item_int_schema.entries))]
+        target_match_fids = set(
+            target_hist_match_config.get("feature_fids", [])
+            if target_hist_match_config.get("enabled", False)
+            else []
+        )
+        item_ns_groups = [
+            [i]
+            for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)
+            if fid not in target_match_fids
+        ]
+
+    if target_hist_match_config.get("enabled", False):
+        item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
+        match_group = [
+            item_fid_to_idx[fid]
+            for fid in target_hist_match_config["feature_fids"]  # type: ignore[index]
+        ]
+        if match_group not in item_ns_groups:
+            item_ns_groups.append(match_group)
+        logging.info(
+            "Added I5_target_hist_match item NS group with fids=%s, indices=%s",
+            target_hist_match_config["feature_fids"],
+            match_group,
+        )
 
     # ---- Build model ----
     user_int_feature_specs = build_feature_specs(

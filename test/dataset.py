@@ -148,6 +148,7 @@ class PCVRParquetDataset(IterableDataset):
         schema_path: str,
         batch_size: int = 256,
         seq_max_lens: Optional[Dict[str, int]] = None,
+        target_hist_match_config: Optional[Dict[str, Any]] = None,
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
@@ -163,6 +164,8 @@ class PCVRParquetDataset(IterableDataset):
             seq_max_lens: optional per-domain override of sequence truncation,
                 e.g. ``{'seq_d': 256}``. Domains not listed fall back to the
                 schema default of 256.
+            target_hist_match_config: optional configuration for dynamic
+                target-history matching item-int features.
             shuffle: whether to shuffle within a ``buffer_batches``-sized window.
             buffer_batches: shuffle buffer size in units of batches.
             row_group_range: ``(start, end)`` slice of Row Groups; ``None`` to
@@ -188,6 +191,10 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.target_hist_match_config = target_hist_match_config or {}
+        self.use_target_hist_match = bool(
+            self.target_hist_match_config.get('enabled', False)
+        )
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -309,6 +316,7 @@ class PCVRParquetDataset(IterableDataset):
         self.sideinfo_fids: Dict[str, List[int]] = {}
         self._seq_prefix: Dict[str, str] = {}
         self._seq_maxlen: Dict[str, int] = {}
+        self._seq_fid_to_slot: Dict[str, Dict[int, int]] = {}
 
         for domain in self.seq_domains:
             cfg = self._seq_cfg[domain]
@@ -322,12 +330,75 @@ class PCVRParquetDataset(IterableDataset):
 
             sideinfo = [fid for fid in all_fids if fid != ts_fid]
             self.sideinfo_fids[domain] = sideinfo
+            self._seq_fid_to_slot[domain] = {
+                fid: i for i, fid in enumerate(sideinfo)
+            }
             self.seq_domain_vocab_sizes[domain] = [
                 self.seq_vocab_sizes[domain][fid] for fid in sideinfo
             ]
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
+
+        self.target_hist_match_feature_ids: List[int] = []
+        self._target_hist_match_offset = self.item_int_schema.total_dim
+        if self.use_target_hist_match:
+            self._init_target_hist_match_schema()
+
+    def _init_target_hist_match_schema(self) -> None:
+        """Append dynamic target-history matching features to item_int schema."""
+        required = [
+            'target_cate_item_fid',
+            'hist_cate_seq_fids',
+            'feature_fids',
+        ]
+        missing = [k for k in required if k not in self.target_hist_match_config]
+        if missing:
+            raise ValueError(
+                f"target_hist_match_config missing required keys: {missing}"
+            )
+
+        feature_fids = list(self.target_hist_match_config['feature_fids'])
+        if len(feature_fids) != 4:
+            raise ValueError(
+                "target_hist_match_config['feature_fids'] must contain 4 fids "
+                "for target_cate_match_v1 features"
+            )
+
+        existing = set(self.item_int_schema.feature_ids)
+        dup = [fid for fid in feature_fids if fid in existing]
+        if dup:
+            raise ValueError(
+                f"target_hist_match feature fids already exist in item_int schema: {dup}"
+            )
+
+        # Max bucket ids for:
+        # cate_in_hist, cate_count_bucket, cate_ratio_bucket,
+        # cate_last_delta_bucket.
+        vocab_sizes = [1, 5, 4, 5]
+        for fid, vs in zip(feature_fids, vocab_sizes):
+            self.item_int_schema.add(int(fid), 1)
+            self.item_int_vocab_sizes.append(vs)
+        self.target_hist_match_feature_ids = [int(fid) for fid in feature_fids]
+
+        target_cate_fid = int(self.target_hist_match_config['target_cate_item_fid'])
+        self._target_cate_offset, self._target_cate_dim = (
+            self.item_int_schema.get_offset_length(target_cate_fid)
+        )
+
+        hist_cate_fids = {
+            str(domain): int(fid)
+            for domain, fid in self.target_hist_match_config['hist_cate_seq_fids'].items()
+        }
+        self._target_hist_cate_slots = {}
+        for domain, fid in hist_cate_fids.items():
+            if domain not in self._seq_fid_to_slot:
+                raise ValueError(f"Unknown sequence domain in hist_cate_seq_fids: {domain}")
+            if fid not in self._seq_fid_to_slot[domain]:
+                raise ValueError(
+                    f"hist_cate_seq_fids[{domain}]={fid} not found in that sequence domain"
+                )
+            self._target_hist_cate_slots[domain] = self._seq_fid_to_slot[domain][fid]
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -502,6 +573,113 @@ class PCVRParquetDataset(IterableDataset):
 
         return padded
 
+    @staticmethod
+    def _bucket_target_cate_count(count: "npt.NDArray[np.int64]") -> "npt.NDArray[np.int64]":
+        bucket = np.zeros_like(count, dtype=np.int64)
+        bucket[count == 1] = 1
+        bucket[count == 2] = 2
+        bucket[(count >= 3) & (count <= 5)] = 3
+        bucket[(count >= 6) & (count <= 10)] = 4
+        bucket[count > 10] = 5
+        return bucket
+
+    @staticmethod
+    def _bucket_target_cate_ratio(
+        count: "npt.NDArray[np.int64]",
+        hist_len: "npt.NDArray[np.int64]",
+    ) -> "npt.NDArray[np.int64]":
+        bucket = np.zeros_like(count, dtype=np.int64)
+        valid = (count > 0) & (hist_len > 0)
+        ratio = np.zeros(count.shape, dtype=np.float32)
+        ratio[valid] = count[valid] / hist_len[valid].astype(np.float32)
+        bucket[(ratio > 0.0) & (ratio <= 0.1)] = 1
+        bucket[(ratio > 0.1) & (ratio <= 0.3)] = 2
+        bucket[(ratio > 0.3) & (ratio <= 0.5)] = 3
+        bucket[ratio > 0.5] = 4
+        return bucket
+
+    @staticmethod
+    def _bucket_target_last_delta(delta_seconds: "npt.NDArray[np.int64]") -> "npt.NDArray[np.int64]":
+        bucket = np.zeros(delta_seconds.shape, dtype=np.int64)
+        valid = delta_seconds >= 0
+        bucket[valid & (delta_seconds <= 3600)] = 1
+        bucket[valid & (delta_seconds > 3600) & (delta_seconds <= 86400)] = 2
+        bucket[valid & (delta_seconds > 86400) & (delta_seconds <= 7 * 86400)] = 3
+        bucket[valid & (delta_seconds > 7 * 86400) & (delta_seconds <= 30 * 86400)] = 4
+        bucket[valid & (delta_seconds > 30 * 86400)] = 5
+        return bucket
+
+    def _accumulate_target_hist_match(
+        self,
+        *,
+        domain: str,
+        seq_values: "npt.NDArray[np.int64]",
+        seq_timestamps: Optional["npt.NDArray[np.int64]"],
+        current_timestamps: "npt.NDArray[np.int64]",
+        target_cate_values: "npt.NDArray[np.int64]",
+        seq_lengths: "npt.NDArray[np.int64]",
+        accum: Dict[str, "npt.NDArray[np.int64]"],
+    ) -> None:
+        """Accumulate v1 target-history matching stats from one sequence domain."""
+        B, _, L = seq_values.shape
+        positions = np.arange(L).reshape(1, L)
+        base_valid = positions < seq_lengths.reshape(B, 1)
+        if seq_timestamps is not None:
+            base_valid &= (seq_timestamps > 0) & (seq_timestamps < current_timestamps.reshape(B, 1))
+
+        cate_slot = self._target_hist_cate_slots.get(domain)
+        if cate_slot is None:
+            return
+
+        hist_cate = seq_values[:, cate_slot, :]
+        cate_valid = base_valid & (hist_cate > 0)
+        accum['hist_cate_len'] += cate_valid.sum(axis=1).astype(np.int64)
+
+        target_cate_valid = target_cate_values > 0
+        if target_cate_values.shape[1] == 1:
+            target_cate = target_cate_values[:, 0].reshape(B, 1)
+            cate_match = (
+                cate_valid
+                & target_cate_valid[:, 0].reshape(B, 1)
+                & (hist_cate == target_cate)
+            )
+        else:
+            cate_match = (
+                cate_valid[:, :, None]
+                & target_cate_valid[:, None, :]
+                & (hist_cate[:, :, None] == target_cate_values[:, None, :])
+            ).any(axis=2)
+
+        accum['cate_match_count'] += cate_match.sum(axis=1).astype(np.int64)
+        if seq_timestamps is not None:
+            delta = current_timestamps.reshape(B, 1) - seq_timestamps
+            masked_delta = np.where(cate_match, delta, np.iinfo(np.int64).max)
+            accum['cate_last_delta'] = np.minimum(
+                accum['cate_last_delta'],
+                masked_delta.min(axis=1),
+            )
+
+    def _write_target_hist_match_features(
+        self,
+        item_int: "npt.NDArray[np.int64]",
+        accum: Dict[str, "npt.NDArray[np.int64]"],
+    ) -> None:
+        """Write v1 target-history matching buckets into appended item_int columns."""
+        if not self.use_target_hist_match:
+            return
+
+        cate_count = accum['cate_match_count']
+        last_delta = accum['cate_last_delta']
+        last_delta = np.where(last_delta == np.iinfo(np.int64).max, -1, last_delta)
+
+        feats = np.stack([
+            (cate_count > 0).astype(np.int64),
+            self._bucket_target_cate_count(cate_count),
+            self._bucket_target_cate_ratio(cate_count, accum['hist_cate_len']),
+            self._bucket_target_last_delta(last_delta),
+        ], axis=1)
+        item_int[:, self._target_hist_match_offset:self._target_hist_match_offset + 4] = feats
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -514,7 +692,6 @@ class PCVRParquetDataset(IterableDataset):
         else:
             labels = np.zeros(B, dtype=np.int64)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
-
         # ---- user_int: write into pre-allocated buffer ----
         # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
         # are treated the same as padding. Features with vs==0 have no vocab
@@ -561,6 +738,18 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
+
+        target_match_accum = None
+        target_cate_values = None
+        if self.use_target_hist_match:
+            target_cate_values = item_int[
+                :, self._target_cate_offset:self._target_cate_offset + self._target_cate_dim
+            ].copy()
+            target_match_accum = {
+                'cate_match_count': np.zeros(B, dtype=np.int64),
+                'hist_cate_len': np.zeros(B, dtype=np.int64),
+                'cate_last_delta': np.full(B, np.iinfo(np.int64).max, dtype=np.int64),
+            }
 
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
@@ -666,6 +855,21 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            if self.use_target_hist_match and target_match_accum is not None:
+                self._accumulate_target_hist_match(
+                    domain=domain,
+                    seq_values=out,
+                    seq_timestamps=ts_padded if ts_ci is not None else None,
+                    current_timestamps=timestamps,
+                    target_cate_values=target_cate_values,
+                    seq_lengths=lengths,
+                    accum=target_match_accum,
+                )
+
+        if self.use_target_hist_match and target_match_accum is not None:
+            self._write_target_hist_match_features(item_int, target_match_accum)
+            result['item_int_feats'] = torch.from_numpy(item_int.copy())
+
         return result
 
 
@@ -681,6 +885,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    target_hist_match_config: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -728,6 +933,7 @@ def get_pcvr_data(
         schema_path=schema_path,
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
+        target_hist_match_config=target_hist_match_config,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
         row_group_range=train_row_group_range,
@@ -750,6 +956,7 @@ def get_pcvr_data(
         schema_path=schema_path,
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
+        target_hist_match_config=target_hist_match_config,
         shuffle=False,
         buffer_batches=0,
         row_group_range=valid_row_group_range,
