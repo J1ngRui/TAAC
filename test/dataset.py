@@ -765,39 +765,3 @@ def get_pcvr_data(
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset
-
-
-def estimate_timestamp_anchor(
-    dataset: PCVRParquetDataset,
-    sample_ratio: float = 0.05,
-    percentile: float = 1.0,
-    seed: int = 42,
-) -> float:
-    """Estimate an early timestamp anchor from sampled training Row Groups.
-
-    The anchor is computed from train data only. Sampling keeps the scan cheap
-    while preserving the timestamp distribution when row groups are shuffled.
-    """
-    if not dataset._rg_list:
-        raise ValueError("Cannot estimate timestamp anchor from an empty dataset")
-
-    rng = random.Random(seed)
-    sample_count = max(1, int(len(dataset._rg_list) * sample_ratio))
-    sample_count = min(sample_count, len(dataset._rg_list))
-    sampled_rgs = rng.sample(dataset._rg_list, sample_count)
-
-    timestamps = []
-    for file_path, rg_idx, _ in sampled_rgs:
-        pf = pq.ParquetFile(file_path)
-        table = pf.read_row_group(rg_idx, columns=['timestamp'])
-        ts = table.column('timestamp').combine_chunks().to_numpy(
-            zero_copy_only=False).astype(np.int64)
-        timestamps.append(ts)
-
-    sampled_ts = np.concatenate(timestamps)
-    anchor_ts = float(np.percentile(sampled_ts, percentile))
-    logging.info(
-        f"Estimated time_context_anchor_ts={anchor_ts:.3f} from "
-        f"{sample_count}/{len(dataset._rg_list)} train row groups "
-        f"(sample_ratio={sample_ratio}, percentile={percentile})")
-    return anchor_ts

@@ -1303,8 +1303,6 @@ class PCVRHyFormer(nn.Module):
         seq_id_threshold: int = 10000,
         use_time_context: bool = False,
         time_context_tz_offset_hours: float = 8.0,
-        time_context_use_anchor_delta: bool = False,
-        time_context_anchor_ts: float = 0.0,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1325,13 +1323,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
-        self.time_context_use_anchor_delta = time_context_use_anchor_delta
         self.ns_tokenizer_type = ns_tokenizer_type
-        if self.use_time_context and self.time_context_use_anchor_delta:
-            self.register_buffer(
-                "time_context_anchor_ts",
-                torch.tensor(float(time_context_anchor_ts), dtype=torch.float32),
-            )
 
         # ================== NS Tokens Construction ==================
 
@@ -1426,20 +1418,12 @@ class PCVRHyFormer(nn.Module):
             )
 
         if self.use_time_context:
+            cyclic_dim = 6
             self.time_context_proj = nn.Sequential(
-                nn.Linear(4, d_model),
+                nn.Linear(cyclic_dim, d_model),
                 nn.LayerNorm(d_model),
-                nn.GELU(),
-                nn.Dropout(dropout_rate)
+                nn.GELU()
             )
-            if self.time_context_use_anchor_delta:
-                self.time_anchor_delta_proj = nn.Sequential(
-                    nn.Linear(1, d_model),
-                    nn.LayerNorm(d_model),
-                    nn.GELU(),
-                    nn.Dropout(dropout_rate)
-                )
-                self.anchor_alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
@@ -1715,7 +1699,8 @@ class PCVRHyFormer(nn.Module):
     def _build_time_context_features(self, timestamp: torch.Tensor) -> torch.Tensor:
         """Build cyclic current-time features from Unix-second timestamps.
 
-        Features are sin/cos for local second-of-day and local day-of-week.
+        Features are sin/cos for local second-of-day, day-of-week, and
+        week-of-month.
         ``time_context_tz_offset_hours`` shifts Unix UTC seconds to the desired
         business timezone before extracting the cycles.
         """
@@ -1724,36 +1709,53 @@ class PCVRHyFormer(nn.Module):
         seconds_per_day = 86400.0
         seconds_of_day = torch.remainder(local_ts, seconds_per_day)
         day_index = torch.floor(local_ts / seconds_per_day)
+        local_day_index = day_index.to(dtype=torch.int64)
         day_of_week = torch.remainder(day_index + 3.0, 7.0)
+        day_of_month = self._unix_day_to_day_of_month(local_day_index).to(dtype=torch.float32)
+        week_of_month = torch.div(
+            day_of_month.to(dtype=torch.int64) - 1,
+            7,
+            rounding_mode='floor'
+        ).to(dtype=torch.float32)
 
         two_pi = 2.0 * math.pi
         day_angle = seconds_of_day / seconds_per_day * two_pi
         week_angle = day_of_week / 7.0 * two_pi
+        month_week_angle = week_of_month / 5.0 * two_pi
         return torch.stack([
             torch.sin(day_angle),
             torch.cos(day_angle),
             torch.sin(week_angle),
             torch.cos(week_angle),
+            torch.sin(month_week_angle),
+            torch.cos(month_week_angle),
         ], dim=-1)
 
-    def _build_anchor_delta_feature(self, timestamp: torch.Tensor) -> torch.Tensor:
-        """Build log-scaled days elapsed from the fixed train-time anchor."""
-        ts = timestamp.to(dtype=torch.float32)
-        anchor_ts = self.time_context_anchor_ts.to(device=ts.device, dtype=ts.dtype)
-        delta_days = torch.clamp(ts - anchor_ts, min=0.0) / 86400.0
-        return torch.log1p(delta_days).unsqueeze(-1)
+    @staticmethod
+    def _unix_day_to_day_of_month(day_index: torch.Tensor) -> torch.Tensor:
+        """Convert Unix day index to Gregorian day-of-month with tensor ops."""
+        z = day_index + 719468
+        era = torch.div(z, 146097, rounding_mode='floor')
+        doe = z - era * 146097
+        yoe = torch.div(
+            doe - torch.div(doe, 1460, rounding_mode='floor')
+            + torch.div(doe, 36524, rounding_mode='floor')
+            - torch.div(doe, 146096, rounding_mode='floor'),
+            365,
+            rounding_mode='floor'
+        )
+        doy = doe - (
+            365 * yoe
+            + torch.div(yoe, 4, rounding_mode='floor')
+            - torch.div(yoe, 100, rounding_mode='floor')
+        )
+        mp = torch.div(5 * doy + 2, 153, rounding_mode='floor')
+        return doy - torch.div(153 * mp + 2, 5, rounding_mode='floor') + 1
 
     def _build_time_context_token(self, timestamp: torch.Tensor) -> torch.Tensor:
-        """Build the time context token, optionally adding anchor-delta residual."""
+        """Build the time context token from cyclic timestamp features."""
         cyclic_feats = self._build_time_context_features(timestamp)
-        time_context_tok = self.time_context_proj(cyclic_feats)
-        if self.time_context_use_anchor_delta:
-            anchor_delta = self._build_anchor_delta_feature(timestamp)
-            time_context_tok = (
-                time_context_tok
-                + self.anchor_alpha * self.time_anchor_delta_proj(anchor_delta)
-            )
-        return time_context_tok
+        return self.time_context_proj(cyclic_feats)
 
     def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
         """Build all non-sequence tokens, including optional time context."""

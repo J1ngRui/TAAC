@@ -67,8 +67,6 @@ _FALLBACK_MODEL_CFG = {
     'seq_id_threshold': 10000,
     'use_time_context': False,
     'time_context_tz_offset_hours': 8.0,
-    'time_context_use_anchor_delta': False,
-    'time_context_anchor_ts': 0.0,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
