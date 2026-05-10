@@ -344,19 +344,26 @@ def loss_bucket_downweighted_bce_loss(
 def weighted_bce_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    start_loss: float = 0.45,
-    end_loss: float = 1.0,
-    min_weight: float = 0.2,
+    p_start: float = 0.95,
+    p_end: float = 0.99,
+    end_weight: float = 0.05,
+    min_weight: float = 0.01,
+    gamma: float = 1.0,
     return_stats: bool = False,
 ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
-    """BCEWithLogits with linear high-loss downweighting.
+    """BCEWithLogits with power-curve downweighting on negative tails.
 
-    Samples at or below ``start_loss`` keep weight 1.0. Samples from
-    ``start_loss`` to ``end_loss`` are linearly annealed down to
-    ``min_weight``. Samples at or above ``end_loss`` use ``min_weight``.
+    Only negative-label samples are eligible. Samples with predicted
+    probability at or below ``p_start`` keep weight 1.0; samples between
+    ``p_start`` and ``p_end`` decay toward ``end_weight`` with
+    ``t ** gamma``; samples above ``p_end`` use ``min_weight``.
     """
-    if end_loss <= start_loss:
-        raise ValueError("end_loss must be greater than start_loss")
+    if not 0.0 < p_start < p_end < 1.0:
+        raise ValueError("Require 0 < p_start < p_end < 1")
+    if not 0.0 < min_weight <= end_weight <= 1.0:
+        raise ValueError("Require 0 < min_weight <= end_weight <= 1")
+    if gamma <= 0.0:
+        raise ValueError("gamma must be positive")
 
     targets = targets.float().view_as(logits)
     loss_raw = F.binary_cross_entropy_with_logits(
@@ -366,16 +373,42 @@ def weighted_bce_loss(
     )
 
     with torch.no_grad():
-        loss_detach = loss_raw.detach()
-        t = ((loss_detach - start_loss) / (end_loss - start_loss)).clamp(0.0, 1.0)
-        weight = 1.0 - t * (1.0 - min_weight)
+        probs = torch.sigmoid(logits.detach())
+        neg_mask = targets < 0.5
+        tail_mask = neg_mask & (probs > p_start) & (probs <= p_end)
+        ultra_mask = neg_mask & (probs > p_end)
+
+        t = ((probs - p_start) / (p_end - p_start)).clamp(0.0, 1.0)
+        down_weight = 1.0 - (1.0 - end_weight) * (t ** gamma)
+        down_weight = down_weight.clamp(min=min_weight, max=1.0)
+
+        weight = torch.ones_like(loss_raw)
+        weight = torch.where(tail_mask, down_weight, weight)
+        weight = torch.where(
+            ultra_mask,
+            torch.full_like(weight, min_weight),
+            weight,
+        )
 
         stats: Optional[Dict[str, float]] = None
         if return_stats:
+            neg_count = neg_mask.float().sum().clamp_min(1.0)
+            eligible_mask = tail_mask | ultra_mask
             stats = {
-                'reweight_ratio': (loss_detach > start_loss).float().mean().item(),
-                'strong_ratio': (loss_detach >= end_loss).float().mean().item(),
+                'neg_ratio': neg_mask.float().mean().item(),
+                'tail_ratio': tail_mask.float().mean().item(),
+                'ultra_ratio': ultra_mask.float().mean().item(),
+                'neg_tail_ratio': (
+                    tail_mask.float().sum() / neg_count
+                ).item(),
+                'neg_ultra_ratio': (
+                    ultra_mask.float().sum() / neg_count
+                ).item(),
+                'eligible_ratio': eligible_mask.float().mean().item(),
                 'avg_weight': weight.mean().item(),
+                'avg_neg_weight': (
+                    (weight * neg_mask.float()).sum() / neg_count
+                ).item(),
             }
 
     loss = (loss_raw * weight).sum() / weight.sum().clamp_min(1.0)

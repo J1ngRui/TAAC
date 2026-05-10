@@ -61,11 +61,13 @@ class PCVRHyFormerRankingTrainer:
         loss_bucket_high_threshold: float = 1.0,
         loss_bucket_medium_weight: float = 0.5,
         loss_bucket_high_weight: float = 0.2,
-        linear_reweight_start_loss: float = 0.45,
-        linear_reweight_end_loss: float = 1.0,
-        linear_reweight_min_weight: float = 0.2,
-        linear_reweight_start_epoch: int = 3,
-        linear_reweight_log_every_n_steps: int = 100,
+        tail_neg_p_start: float = 0.95,
+        tail_neg_p_end: float = 0.99,
+        tail_neg_end_weight: float = 0.05,
+        tail_neg_min_weight: float = 0.01,
+        tail_neg_gamma: float = 1.0,
+        tail_neg_start_epoch: int = 3,
+        tail_neg_log_every_n_steps: int = 100,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -125,11 +127,13 @@ class PCVRHyFormerRankingTrainer:
         self.loss_bucket_high_threshold: float = loss_bucket_high_threshold
         self.loss_bucket_medium_weight: float = loss_bucket_medium_weight
         self.loss_bucket_high_weight: float = loss_bucket_high_weight
-        self.linear_reweight_start_loss: float = linear_reweight_start_loss
-        self.linear_reweight_end_loss: float = linear_reweight_end_loss
-        self.linear_reweight_min_weight: float = linear_reweight_min_weight
-        self.linear_reweight_start_epoch: int = linear_reweight_start_epoch
-        self.linear_reweight_log_every_n_steps: int = linear_reweight_log_every_n_steps
+        self.tail_neg_p_start: float = tail_neg_p_start
+        self.tail_neg_p_end: float = tail_neg_p_end
+        self.tail_neg_end_weight: float = tail_neg_end_weight
+        self.tail_neg_min_weight: float = tail_neg_min_weight
+        self.tail_neg_gamma: float = tail_neg_gamma
+        self.tail_neg_start_epoch: int = tail_neg_start_epoch
+        self.tail_neg_log_every_n_steps: int = tail_neg_log_every_n_steps
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -147,10 +151,12 @@ class PCVRHyFormerRankingTrainer:
                      f"loss_bucket_high_threshold={loss_bucket_high_threshold}, "
                      f"loss_bucket_medium_weight={loss_bucket_medium_weight}, "
                      f"loss_bucket_high_weight={loss_bucket_high_weight}, "
-                     f"linear_reweight_start_loss={linear_reweight_start_loss}, "
-                     f"linear_reweight_end_loss={linear_reweight_end_loss}, "
-                     f"linear_reweight_min_weight={linear_reweight_min_weight}, "
-                     f"linear_reweight_start_epoch={linear_reweight_start_epoch}, "
+                     f"tail_neg_p_start={tail_neg_p_start}, "
+                     f"tail_neg_p_end={tail_neg_p_end}, "
+                     f"tail_neg_end_weight={tail_neg_end_weight}, "
+                     f"tail_neg_min_weight={tail_neg_min_weight}, "
+                     f"tail_neg_gamma={tail_neg_gamma}, "
+                     f"tail_neg_start_epoch={tail_neg_start_epoch}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
@@ -474,28 +480,32 @@ class PCVRHyFormerRankingTrainer:
                 high_loss_weight=self.loss_bucket_high_weight,
             )
         elif self.loss_type == 'weighted_bce':
-            if epoch >= self.linear_reweight_start_epoch:
+            if epoch >= self.tail_neg_start_epoch:
                 current_step = total_step + 1
                 log_stats = (
-                    self.linear_reweight_log_every_n_steps > 0
-                    and current_step % self.linear_reweight_log_every_n_steps == 0
+                    self.tail_neg_log_every_n_steps > 0
+                    and current_step % self.tail_neg_log_every_n_steps == 0
                 )
                 loss, stats = weighted_bce_loss(
                     logits,
                     label,
-                    start_loss=self.linear_reweight_start_loss,
-                    end_loss=self.linear_reweight_end_loss,
-                    min_weight=self.linear_reweight_min_weight,
+                    p_start=self.tail_neg_p_start,
+                    p_end=self.tail_neg_p_end,
+                    end_weight=self.tail_neg_end_weight,
+                    min_weight=self.tail_neg_min_weight,
+                    gamma=self.tail_neg_gamma,
                     return_stats=log_stats,
                 )
                 if stats is not None:
                     print(
-                        f"[loss linear reweight] "
-                        f"loss>{self.linear_reweight_start_loss}: "
-                        f"{stats['reweight_ratio']:.4%}, "
-                        f"loss>={self.linear_reweight_end_loss}: "
-                        f"{stats['strong_ratio']:.4%}, "
-                        f"avg_weight: {stats['avg_weight']:.4f}"
+                        f"[loss tail neg] "
+                        f"neg: {stats['neg_ratio']:.4%}, "
+                        f"tail(p>{self.tail_neg_p_start}): {stats['tail_ratio']:.4%}, "
+                        f"ultra(p>{self.tail_neg_p_end}): {stats['ultra_ratio']:.4%}, "
+                        f"neg_tail: {stats['neg_tail_ratio']:.4%}, "
+                        f"neg_ultra: {stats['neg_ultra_ratio']:.4%}, "
+                        f"avg_weight: {stats['avg_weight']:.4f}, "
+                        f"avg_neg_weight: {stats['avg_neg_weight']:.4f}"
                     )
             else:
                 loss = F.binary_cross_entropy_with_logits(logits, label)

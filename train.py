@@ -213,7 +213,7 @@ def parse_args() -> argparse.Namespace:
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
                              'conflict_bce = BCE with extreme probability conflicts downweighted, '
                              'loss_bucket_bce = BCE with high-loss samples downweighted, '
-                             'weighted_bce = BCE with linear high-loss reweighting '
+                             'weighted_bce = BCE with tail negative downweighting '
                              'after warmup')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
@@ -243,21 +243,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--loss_bucket_high_weight', type=float, default=0.2,
                         help='Weight for high-loss samples '
                              '(effective only when --loss_type=loss_bucket_bce)')
-    parser.add_argument('--linear_reweight_start_loss', type=float, default=0.45,
-                        help='Per-example BCE where linear reweighting starts '
+    parser.add_argument('--tail_neg_p_start', type=float, default=0.95,
+                        help='Predicted probability where negative-label tail '
+                             'downweighting starts (effective only when '
+                             '--loss_type=weighted_bce)')
+    parser.add_argument('--tail_neg_p_end', type=float, default=0.99,
+                        help='Predicted probability where tail downweighting '
+                             'reaches --tail_neg_end_weight (effective only when '
+                             '--loss_type=weighted_bce)')
+    parser.add_argument('--tail_neg_end_weight', type=float, default=0.05,
+                        help='Weight at --tail_neg_p_end for negative-label samples '
                              '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--linear_reweight_end_loss', type=float, default=1.0,
-                        help='Per-example BCE where linear reweighting reaches min weight '
+    parser.add_argument('--tail_neg_min_weight', type=float, default=0.01,
+                        help='Weight for negative-label samples above --tail_neg_p_end '
                              '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--linear_reweight_min_weight', type=float, default=0.2,
-                        help='Minimum sample weight for linear high-loss reweighting '
+    parser.add_argument('--tail_neg_gamma', type=float, default=1.0,
+                        help='Power for tail negative downweighting '
                              '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--linear_reweight_start_epoch', type=int, default=3,
-                        help='First epoch that enables linear high-loss reweighting '
+    parser.add_argument('--tail_neg_start_epoch', type=int, default=3,
+                        help='First epoch that enables tail negative downweighting '
                              '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--linear_reweight_log_every_n_steps', type=int, default=100,
-                        help='Print linear reweight stats every N training steps '
-                             '(0 = disable; effective only when linear reweighting is active)')
+    parser.add_argument('--tail_neg_log_every_n_steps', type=int, default=100,
+                        help='Print tail negative reweight stats every N training steps '
+                             '(0 = disable; effective only when weighted_bce is active)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -494,11 +502,13 @@ def main() -> None:
         loss_bucket_high_threshold=args.loss_bucket_high_threshold,
         loss_bucket_medium_weight=args.loss_bucket_medium_weight,
         loss_bucket_high_weight=args.loss_bucket_high_weight,
-        linear_reweight_start_loss=args.linear_reweight_start_loss,
-        linear_reweight_end_loss=args.linear_reweight_end_loss,
-        linear_reweight_min_weight=args.linear_reweight_min_weight,
-        linear_reweight_start_epoch=args.linear_reweight_start_epoch,
-        linear_reweight_log_every_n_steps=args.linear_reweight_log_every_n_steps,
+        tail_neg_p_start=args.tail_neg_p_start,
+        tail_neg_p_end=args.tail_neg_p_end,
+        tail_neg_end_weight=args.tail_neg_end_weight,
+        tail_neg_min_weight=args.tail_neg_min_weight,
+        tail_neg_gamma=args.tail_neg_gamma,
+        tail_neg_start_epoch=args.tail_neg_start_epoch,
+        tail_neg_log_every_n_steps=args.tail_neg_log_every_n_steps,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,

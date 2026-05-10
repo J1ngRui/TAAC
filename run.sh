@@ -17,9 +17,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --loss_type weighted_bce \
-    --linear_reweight_start_loss 2.3 \
-    --linear_reweight_end_loss 3.0 \
-    --linear_reweight_min_weight 0.8 \
-    --linear_reweight_start_epoch 3 \
+    --tail_neg_p_start 0.95 \
+    --tail_neg_p_end 0.99 \
+    --tail_neg_end_weight 0.05 \
+    --tail_neg_min_weight 0.01 \
+    --tail_neg_gamma 1.0 \
+    --tail_neg_start_epoch 3 \
     --dropout_rate 0.01 \
     "$@"

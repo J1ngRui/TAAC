@@ -53,6 +53,8 @@ domain sequence 表征
 
 ## Baseline
 
+##### 1.NS Tokenizer
+
 ```
 GroupNSTokenizer
 按语义 group 生成 NS token。
@@ -123,6 +125,12 @@ NS token 数量可控。
 当更关注控制 token 数量、降低后续 mixer 计算压力时，可以使用 RankMixerNSTokenizer。
 如果 group 数太多，直接一个 group 一个 token 会导致模型过重，可以考虑这种固定 token 数的方式。
 ```
+
+2.
+
+
+
+
 
 
 
@@ -430,6 +438,82 @@ target_cate_last_delta_bucket: never / <=1h / <=1d / <=7d / <=30d / >30d
 新增 I5 后 num_ns + 1。
 当前 group + time_context 配置下 T 从 21 变成 22；
 RankMixer full 下 run.sh 使用 d_model=88，满足 88 % 22 == 0。
+
+当前定位：
+Stage9 是当前 run.sh 的 active 结构版本。
+代码中仍然使用 --loss_type weighted_bce 这个入口，
+但 weighted_bce 的含义已经从旧版“按 BCE loss 线性降权”更新为：
+只对 label=0 且模型预测概率极高的负样本尾部做降权。
+
+动机：
+上一版 weighted BCE 观察到 valid logloss 下降，但 AUC 略降。
+这说明 reweight 确实缓解了高 loss / 毒点对 logloss 的影响，
+但阈值过早时会碰到一部分仍有排序价值的 hard negative / 高分边界样本，
+导致排序性能被轻微伤到。
+
+因此当前版本把降权区域从原先约 p=0.90~0.95 往后推，
+只处理更极端的负样本尾部。
+目标不是完全删除这些样本，而是把它们从“强监督信号”
+降级成“弱扰动信号”，避免单个极端负样本推翻模型已经学到的主模式：
+
+p <= 0.95:
+    weight = 1.0
+
+0.95 < p <= 0.99:
+    t = (p - 0.95) / (0.99 - 0.95)
+    weight = 1 - 0.95 * t
+
+p > 0.99:
+    weight = 0.01
+
+例如 label=0 且 p=0.99 时：
+raw_loss = -log(1 - 0.99) ≈ 4.605
+weight = 0.05
+weighted_loss ≈ 0.23
+
+这大致接近普通负样本 p=0.2 的 BCE 量级：
+loss = -log(1 - 0.2) ≈ 0.223
+
+因此极端错判负样本仍然参与训练，
+但只允许它对模型产生小幅扰动。
+
+核心假设：
+p < 0.95 的负样本可能包含 hard negative 和排序边界价值，不动。
+p >= 0.95 的负样本更像假负样本、归因噪声、延迟转化或异常毒点。
+p > 0.99 的负样本属于极端高置信冲突样本，直接强压到 min_weight。
+
+warmup：
+epoch < 3 使用标准 BCE，先让模型学习主模式。
+epoch >= 3 启用 tail negative downweight。
+
+loss 归一化：
+仍然使用加权归一化，避免因为某个 batch 毒点较多而整体缩小学习率：
+
+loss = sum(loss_raw * weight) / sum(weight)
+
+当前参数：
+--loss_type weighted_bce
+--tail_neg_p_start 0.95
+--tail_neg_p_end 0.99
+--tail_neg_end_weight 0.05
+--tail_neg_min_weight 0.01
+--tail_neg_gamma 1.0
+--tail_neg_start_epoch 3
+
+训练日志：
+开启后定期打印：
+neg_ratio：batch 中负样本比例
+tail_ratio：label=0 且 p 在 (0.95, 0.99] 的样本比例
+ultra_ratio：label=0 且 p > 0.99 的样本比例
+neg_tail_ratio：负样本内部 tail 占比
+neg_ultra_ratio：负样本内部 ultra 占比
+avg_weight / avg_neg_weight：整体和负样本平均权重
+
+评估关注：
+如果该版本有效，预期现象是：
+1. valid AUC 相比旧线性 reweight 恢复或少降；
+2. valid logloss 继续保持稳定收益；
+3. tail_ratio / ultra_ratio 只占很小尾部，证明没有大面积削弱 hard negative。
 ```
 
 
