@@ -51,6 +51,79 @@ domain sequence 表征
 
 
 
+## Baseline
+
+```
+GroupNSTokenizer
+按语义 group 生成 NS token。
+
+处理流程：
+1. 遍历每个离散特征 fid。
+2. 每个 fid 使用自己对应的 embedding table 得到 fid_emb。
+3. 如果 fid 是 multi-value 特征，则先对多个 value 的 embedding 做 mask mean pooling，
+得到一个固定维度的 fid_emb。
+4. 对同一个 group 内的多个 fid_emb 做 concat。
+5. 将 concat 后的 group embedding 经过 Linear + LayerNorm + SiLU。
+6. 每个 group 最终生成一个 d_model 维的 NS token。
+
+输出形式：
+(B, num_groups, d_model)
+
+建模含义：
+一个 group 对应一个 token。
+每个 token 保留相对清晰的语义边界，例如用户属性 token、item 属性 token、时间上下文 token 等。
+
+优点：
+语义边界清楚，信息不容易被打散。
+不同 group 使用独立 projection，更适合异质特征建模。
+适合保留 user、item、time、domain 等不同特征块的原始语义。
+
+缺点：
+NS token 数量由 group 数决定，不够自由。
+如果 group 划分过细，token 数会增加，后续 RankMixer / Attention 的建模压力会变大。
+multi-value 特征当前使用 mean pooling，可能会损失 value 内部的重要性差异。
+
+适用场景：
+当特征本身有明确语义分组时，更适合使用 GroupNSTokenizer。
+尤其适合当前 PCVR 任务中用户特征、物品特征、时间特征、行为特征等异质特征较多的情况。
+```
+
+```
+RankMixerNSTokenizer
+先将所有 fid embedding 拉平成一个长向量，再均匀切成固定数量的 NS token。
+
+处理流程：
+1. 遍历所有 group 内的 fid。
+2. 每个 fid 使用对应的 embedding table 得到 fid_emb。
+3. 如果 fid 是 multi-value 特征，则先对多个 value 的 embedding 做 mask mean pooling。
+4. 将所有 fid_emb 按 group 顺序全部 concat 成一个长向量。
+5. 如果总维度不能被 num_ns_tokens 整除，则在最后 padding。
+6. 将长向量均匀 split 成 num_ns_tokens 个 chunk。
+7. 每个 chunk 经过独立的 Linear + LayerNorm + SiLU。
+8. 每个 chunk 最终生成一个 d_model 维的 NS token。
+
+输出形式：
+(B, num_ns_tokens, d_model)
+
+建模含义：
+不是一个语义 group 对应一个 token，而是把所有离散特征 embedding 拼接后，按长度均匀切块。
+因此 token 数量可以自由控制，但 token 内部不一定保持完整语义边界。
+
+优点：
+NS token 数量可控。
+可以固定为任意 num_ns_tokens，方便控制模型复杂度和计算量。
+更接近 RankMixer 原始的 token 化思路。
+
+缺点：
+语义边界可能被打散。
+某个 token 可能同时包含一个 group 的后半部分和另一个 group 的前半部分。
+如果特征异质性很强，均匀切块可能会造成语义混合和信息损失。
+
+适用场景：
+当更关注控制 token 数量、降低后续 mixer 计算压力时，可以使用 RankMixerNSTokenizer。
+如果 group 数太多，直接一个 group 一个 token 会导致模型过重，可以考虑这种固定 token 数的方式。
+```
+
 
 
 ## TS / Time Context 优化 Timeline

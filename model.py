@@ -1013,6 +1013,7 @@ class GroupNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
+        
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
         real_idx = 0
