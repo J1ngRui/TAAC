@@ -206,13 +206,9 @@ def parse_args() -> argparse.Namespace:
                         choices=[
                             'bce',
                             'focal',
-                            'conflict_bce',
-                            'loss_bucket_bce',
                             'weighted_bce',
                         ],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
-                             'conflict_bce = BCE with extreme probability conflicts downweighted, '
-                             'loss_bucket_bce = BCE with high-loss samples downweighted, '
                              'weighted_bce = BCE with tail negative downweighting '
                              'after warmup')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
@@ -221,28 +217,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
-    parser.add_argument('--conflict_pos_prob_threshold', type=float, default=0.05,
-                        help='Downweight positive labels when sigmoid(logit) is below '
-                             'this threshold (effective only when --loss_type=conflict_bce)')
-    parser.add_argument('--conflict_neg_prob_threshold', type=float, default=0.95,
-                        help='Downweight negative labels when sigmoid(logit) is above '
-                             'this threshold (effective only when --loss_type=conflict_bce)')
-    parser.add_argument('--conflict_weight', type=float, default=0.2,
-                        help='Weight assigned to extreme conflict samples '
-                             '(effective only when --loss_type=conflict_bce)')
-    parser.add_argument('--loss_bucket_medium_threshold', type=float, default=0.5,
-                        help='Samples with per-example BCE above this threshold and at or '
-                             'below --loss_bucket_high_threshold receive medium weight '
-                             '(effective only when --loss_type=loss_bucket_bce)')
-    parser.add_argument('--loss_bucket_high_threshold', type=float, default=1.0,
-                        help='Samples with per-example BCE above this threshold receive '
-                             'high-loss weight (effective only when --loss_type=loss_bucket_bce)')
-    parser.add_argument('--loss_bucket_medium_weight', type=float, default=0.5,
-                        help='Weight for medium-loss samples '
-                             '(effective only when --loss_type=loss_bucket_bce)')
-    parser.add_argument('--loss_bucket_high_weight', type=float, default=0.2,
-                        help='Weight for high-loss samples '
-                             '(effective only when --loss_type=loss_bucket_bce)')
     parser.add_argument('--tail_neg_p_start', type=float, default=0.95,
                         help='Predicted probability where negative-label tail '
                              'downweighting starts (effective only when '
@@ -495,13 +469,6 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
-        conflict_pos_prob_threshold=args.conflict_pos_prob_threshold,
-        conflict_neg_prob_threshold=args.conflict_neg_prob_threshold,
-        conflict_weight=args.conflict_weight,
-        loss_bucket_medium_threshold=args.loss_bucket_medium_threshold,
-        loss_bucket_high_threshold=args.loss_bucket_high_threshold,
-        loss_bucket_medium_weight=args.loss_bucket_medium_weight,
-        loss_bucket_high_weight=args.loss_bucket_high_weight,
         tail_neg_p_start=args.tail_neg_p_start,
         tail_neg_p_end=args.tail_neg_p_end,
         tail_neg_end_weight=args.tail_neg_end_weight,

@@ -19,8 +19,6 @@ from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
 from utils import (
-    conflict_downweighted_bce_loss,
-    loss_bucket_downweighted_bce_loss,
     sigmoid_focal_loss,
     weighted_bce_loss,
     EarlyStopping,
@@ -54,13 +52,6 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
-        conflict_pos_prob_threshold: float = 0.05,
-        conflict_neg_prob_threshold: float = 0.95,
-        conflict_weight: float = 0.2,
-        loss_bucket_medium_threshold: float = 0.5,
-        loss_bucket_high_threshold: float = 1.0,
-        loss_bucket_medium_weight: float = 0.5,
-        loss_bucket_high_weight: float = 0.2,
         tail_neg_p_start: float = 0.95,
         tail_neg_p_end: float = 0.99,
         tail_neg_end_weight: float = 0.05,
@@ -120,13 +111,6 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
-        self.conflict_pos_prob_threshold: float = conflict_pos_prob_threshold
-        self.conflict_neg_prob_threshold: float = conflict_neg_prob_threshold
-        self.conflict_weight: float = conflict_weight
-        self.loss_bucket_medium_threshold: float = loss_bucket_medium_threshold
-        self.loss_bucket_high_threshold: float = loss_bucket_high_threshold
-        self.loss_bucket_medium_weight: float = loss_bucket_medium_weight
-        self.loss_bucket_high_weight: float = loss_bucket_high_weight
         self.tail_neg_p_start: float = tail_neg_p_start
         self.tail_neg_p_end: float = tail_neg_p_end
         self.tail_neg_end_weight: float = tail_neg_end_weight
@@ -144,13 +128,6 @@ class PCVRHyFormerRankingTrainer:
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"conflict_pos_prob_threshold={conflict_pos_prob_threshold}, "
-                     f"conflict_neg_prob_threshold={conflict_neg_prob_threshold}, "
-                     f"conflict_weight={conflict_weight}, "
-                     f"loss_bucket_medium_threshold={loss_bucket_medium_threshold}, "
-                     f"loss_bucket_high_threshold={loss_bucket_high_threshold}, "
-                     f"loss_bucket_medium_weight={loss_bucket_medium_weight}, "
-                     f"loss_bucket_high_weight={loss_bucket_high_weight}, "
                      f"tail_neg_p_start={tail_neg_p_start}, "
                      f"tail_neg_p_end={tail_neg_p_end}, "
                      f"tail_neg_end_weight={tail_neg_end_weight}, "
@@ -462,23 +439,6 @@ class PCVRHyFormerRankingTrainer:
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        elif self.loss_type == 'conflict_bce':
-            loss = conflict_downweighted_bce_loss(
-                logits,
-                label,
-                pos_prob_threshold=self.conflict_pos_prob_threshold,
-                neg_prob_threshold=self.conflict_neg_prob_threshold,
-                conflict_weight=self.conflict_weight,
-            )
-        elif self.loss_type == 'loss_bucket_bce':
-            loss = loss_bucket_downweighted_bce_loss(
-                logits,
-                label,
-                medium_loss_threshold=self.loss_bucket_medium_threshold,
-                high_loss_threshold=self.loss_bucket_high_threshold,
-                medium_loss_weight=self.loss_bucket_medium_weight,
-                high_loss_weight=self.loss_bucket_high_weight,
-            )
         elif self.loss_type == 'weighted_bce':
             if epoch >= self.tail_neg_start_epoch:
                 current_step = total_step + 1
