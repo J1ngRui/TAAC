@@ -20,7 +20,6 @@ from sklearn.metrics import roc_auc_score
 
 from utils import (
     sigmoid_focal_loss,
-    weighted_bce_loss,
     EarlyStopping,
 )
 from model import ModelInput
@@ -52,13 +51,6 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
-        tail_neg_p_start: float = 0.95,
-        tail_neg_p_end: float = 0.99,
-        tail_neg_end_weight: float = 0.05,
-        tail_neg_min_weight: float = 0.01,
-        tail_neg_gamma: float = 1.0,
-        tail_neg_start_epoch: int = 3,
-        tail_neg_log_every_n_steps: int = 100,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -111,13 +103,6 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
-        self.tail_neg_p_start: float = tail_neg_p_start
-        self.tail_neg_p_end: float = tail_neg_p_end
-        self.tail_neg_end_weight: float = tail_neg_end_weight
-        self.tail_neg_min_weight: float = tail_neg_min_weight
-        self.tail_neg_gamma: float = tail_neg_gamma
-        self.tail_neg_start_epoch: int = tail_neg_start_epoch
-        self.tail_neg_log_every_n_steps: int = tail_neg_log_every_n_steps
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -128,12 +113,6 @@ class PCVRHyFormerRankingTrainer:
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"tail_neg_p_start={tail_neg_p_start}, "
-                     f"tail_neg_p_end={tail_neg_p_end}, "
-                     f"tail_neg_end_weight={tail_neg_end_weight}, "
-                     f"tail_neg_min_weight={tail_neg_min_weight}, "
-                     f"tail_neg_gamma={tail_neg_gamma}, "
-                     f"tail_neg_start_epoch={tail_neg_start_epoch}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
@@ -439,36 +418,6 @@ class PCVRHyFormerRankingTrainer:
 
         if self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        elif self.loss_type == 'weighted_bce':
-            if epoch >= self.tail_neg_start_epoch:
-                current_step = total_step + 1
-                log_stats = (
-                    self.tail_neg_log_every_n_steps > 0
-                    and current_step % self.tail_neg_log_every_n_steps == 0
-                )
-                loss, stats = weighted_bce_loss(
-                    logits,
-                    label,
-                    p_start=self.tail_neg_p_start,
-                    p_end=self.tail_neg_p_end,
-                    end_weight=self.tail_neg_end_weight,
-                    min_weight=self.tail_neg_min_weight,
-                    gamma=self.tail_neg_gamma,
-                    return_stats=log_stats,
-                )
-                if stats is not None:
-                    print(
-                        f"[loss tail neg] "
-                        f"neg: {stats['neg_ratio']:.4%}, "
-                        f"tail(p>{self.tail_neg_p_start}): {stats['tail_ratio']:.4%}, "
-                        f"ultra(p>{self.tail_neg_p_end}): {stats['ultra_ratio']:.4%}, "
-                        f"neg_tail: {stats['neg_tail_ratio']:.4%}, "
-                        f"neg_ultra: {stats['neg_ultra_ratio']:.4%}, "
-                        f"avg_weight: {stats['avg_weight']:.4f}, "
-                        f"avg_neg_weight: {stats['avg_neg_weight']:.4f}"
-                    )
-            else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()

@@ -206,40 +206,14 @@ def parse_args() -> argparse.Namespace:
                         choices=[
                             'bce',
                             'focal',
-                            'weighted_bce',
                         ],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss, '
-                             'weighted_bce = BCE with tail negative downweighting '
-                             'after warmup')
+                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
-    parser.add_argument('--tail_neg_p_start', type=float, default=0.95,
-                        help='Predicted probability where negative-label tail '
-                             'downweighting starts (effective only when '
-                             '--loss_type=weighted_bce)')
-    parser.add_argument('--tail_neg_p_end', type=float, default=0.99,
-                        help='Predicted probability where tail downweighting '
-                             'reaches --tail_neg_end_weight (effective only when '
-                             '--loss_type=weighted_bce)')
-    parser.add_argument('--tail_neg_end_weight', type=float, default=0.05,
-                        help='Weight at --tail_neg_p_end for negative-label samples '
-                             '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--tail_neg_min_weight', type=float, default=0.01,
-                        help='Weight for negative-label samples above --tail_neg_p_end '
-                             '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--tail_neg_gamma', type=float, default=1.0,
-                        help='Power for tail negative downweighting '
-                             '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--tail_neg_start_epoch', type=int, default=3,
-                        help='First epoch that enables tail negative downweighting '
-                             '(effective only when --loss_type=weighted_bce)')
-    parser.add_argument('--tail_neg_log_every_n_steps', type=int, default=100,
-                        help='Print tail negative reweight stats every N training steps '
-                             '(0 = disable; effective only when weighted_bce is active)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -469,13 +443,6 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
-        tail_neg_p_start=args.tail_neg_p_start,
-        tail_neg_p_end=args.tail_neg_p_end,
-        tail_neg_end_weight=args.tail_neg_end_weight,
-        tail_neg_min_weight=args.tail_neg_min_weight,
-        tail_neg_gamma=args.tail_neg_gamma,
-        tail_neg_start_epoch=args.tail_neg_start_epoch,
-        tail_neg_log_every_n_steps=args.tail_neg_log_every_n_steps,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,

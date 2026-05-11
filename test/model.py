@@ -1418,7 +1418,7 @@ class PCVRHyFormer(nn.Module):
             )
 
         if self.use_time_context:
-            cyclic_dim = 6
+            cyclic_dim = 4
             self.time_context_proj = nn.Sequential(
                 nn.Linear(cyclic_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -1699,8 +1699,7 @@ class PCVRHyFormer(nn.Module):
     def _build_time_context_features(self, timestamp: torch.Tensor) -> torch.Tensor:
         """Build cyclic current-time features from Unix-second timestamps.
 
-        Features are sin/cos for local second-of-day, day-of-week, and
-        week-of-month.
+        Features are sin/cos for local second-of-day and day-of-week.
         ``time_context_tz_offset_hours`` shifts Unix UTC seconds to the desired
         business timezone before extracting the cycles.
         """
@@ -1709,48 +1708,17 @@ class PCVRHyFormer(nn.Module):
         seconds_per_day = 86400.0
         seconds_of_day = torch.remainder(local_ts, seconds_per_day)
         day_index = torch.floor(local_ts / seconds_per_day)
-        local_day_index = day_index.to(dtype=torch.int64)
         day_of_week = torch.remainder(day_index + 3.0, 7.0)
-        day_of_month = self._unix_day_to_day_of_month(local_day_index).to(dtype=torch.float32)
-        week_of_month = torch.div(
-            day_of_month.to(dtype=torch.int64) - 1,
-            7,
-            rounding_mode='floor'
-        ).to(dtype=torch.float32)
 
         two_pi = 2.0 * math.pi
         day_angle = seconds_of_day / seconds_per_day * two_pi
         week_angle = day_of_week / 7.0 * two_pi
-        month_week_angle = week_of_month / 5.0 * two_pi
         return torch.stack([
             torch.sin(day_angle),
             torch.cos(day_angle),
             torch.sin(week_angle),
             torch.cos(week_angle),
-            torch.sin(month_week_angle),
-            torch.cos(month_week_angle),
         ], dim=-1)
-
-    @staticmethod
-    def _unix_day_to_day_of_month(day_index: torch.Tensor) -> torch.Tensor:
-        """Convert Unix day index to Gregorian day-of-month with tensor ops."""
-        z = day_index + 719468
-        era = torch.div(z, 146097, rounding_mode='floor')
-        doe = z - era * 146097
-        yoe = torch.div(
-            doe - torch.div(doe, 1460, rounding_mode='floor')
-            + torch.div(doe, 36524, rounding_mode='floor')
-            - torch.div(doe, 146096, rounding_mode='floor'),
-            365,
-            rounding_mode='floor'
-        )
-        doy = doe - (
-            365 * yoe
-            + torch.div(yoe, 4, rounding_mode='floor')
-            - torch.div(yoe, 100, rounding_mode='floor')
-        )
-        mp = torch.div(5 * doy + 2, 153, rounding_mode='floor')
-        return doy - torch.div(153 * mp + 2, 5, rounding_mode='floor') + 1
 
     def _build_time_context_token(self, timestamp: torch.Tensor) -> torch.Tensor:
         """Build the time context token from cyclic timestamp features."""

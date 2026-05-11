@@ -1,4 +1,4 @@
-### 特征分析
+### 特征
 
 | Category                 | Count | Dateset                 | Description                                                  |
 | :----------------------- | :---- | :---------------------- | :----------------------------------------------------------- |
@@ -8,14 +8,7 @@
 | Item Int Features        | 14    | `int64` / `list<int64>` | Discrete item features, including item categories, types, and other basic information, as well as multi-label information for items. |
 | Domain Sequence Features | 45    | `list<int64>`           | Behavioral sequence features from 4 domains.                 |
 
-| Column    | user_id | item_id | label_type | label_time   | timestamp  |
-| :-------- | ------- | ------- | ---------- | ------------ | ---------- |
-| Date Type | `int64` | `int64` | `int32`    | `int64`      | `int64`    |
-|           |         |         | 标签类型   | 时间监督信号 | 样本时间戳 |
-
-
-
-### DataSet数据分布
+### DataSet 数据分布分析
 
 问题：val与online test 指标存在较大的gap
 
@@ -49,478 +42,150 @@ domain sequence 表征
 用户 dense 特征
 ```
 
-
-
 ## Baseline
 
-##### 1.NS Tokenizer
-
-```
-GroupNSTokenizer
-按语义 group 生成 NS token。
-
-处理流程：
-1. 遍历每个离散特征 fid。
-2. 每个 fid 使用自己对应的 embedding table 得到 fid_emb。
-3. 如果 fid 是 multi-value 特征，则先对多个 value 的 embedding 做 mask mean pooling，
-得到一个固定维度的 fid_emb。
-4. 对同一个 group 内的多个 fid_emb 做 concat。
-5. 将 concat 后的 group embedding 经过 Linear + LayerNorm + SiLU。
-6. 每个 group 最终生成一个 d_model 维的 NS token。
-
-输出形式：
-(B, num_groups, d_model)
-
-建模含义：
-一个 group 对应一个 token。
-每个 token 保留相对清晰的语义边界，例如用户属性 token、item 属性 token、时间上下文 token 等。
-
-优点：
-语义边界清楚，信息不容易被打散。
-不同 group 使用独立 projection，更适合异质特征建模。
-适合保留 user、item、time、domain 等不同特征块的原始语义。
-
-缺点：
-NS token 数量由 group 数决定，不够自由。
-如果 group 划分过细，token 数会增加，后续 RankMixer / Attention 的建模压力会变大。
-multi-value 特征当前使用 mean pooling，可能会损失 value 内部的重要性差异。
-
-适用场景：
-当特征本身有明确语义分组时，更适合使用 GroupNSTokenizer。
-尤其适合当前 PCVR 任务中用户特征、物品特征、时间特征、行为特征等异质特征较多的情况。
-```
-
-```
-RankMixerNSTokenizer
-先将所有 fid embedding 拉平成一个长向量，再均匀切成固定数量的 NS token。
-
-处理流程：
-1. 遍历所有 group 内的 fid。
-2. 每个 fid 使用对应的 embedding table 得到 fid_emb。
-3. 如果 fid 是 multi-value 特征，则先对多个 value 的 embedding 做 mask mean pooling。
-4. 将所有 fid_emb 按 group 顺序全部 concat 成一个长向量。
-5. 如果总维度不能被 num_ns_tokens 整除，则在最后 padding。
-6. 将长向量均匀 split 成 num_ns_tokens 个 chunk。
-7. 每个 chunk 经过独立的 Linear + LayerNorm + SiLU。
-8. 每个 chunk 最终生成一个 d_model 维的 NS token。
-
-输出形式：
-(B, num_ns_tokens, d_model)
-
-建模含义：
-不是一个语义 group 对应一个 token，而是把所有离散特征 embedding 拼接后，按长度均匀切块。
-因此 token 数量可以自由控制，但 token 内部不一定保持完整语义边界。
-
-优点：
-NS token 数量可控。
-可以固定为任意 num_ns_tokens，方便控制模型复杂度和计算量。
-更接近 RankMixer 原始的 token 化思路。
-
-缺点：
-语义边界可能被打散。
-某个 token 可能同时包含一个 group 的后半部分和另一个 group 的前半部分。
-如果特征异质性很强，均匀切块可能会造成语义混合和信息损失。
-
-适用场景：
-当更关注控制 token 数量、降低后续 mixer 计算压力时，可以使用 RankMixerNSTokenizer。
-如果 group 数太多，直接一个 group 一个 token 会导致模型过重，可以考虑这种固定 token 数的方式。
-```
-
-2.
-
-
-
-
+Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，README 只保留后续实验 timeline。
 
 
 
 ## TS / Time Context 优化 Timeline
 
-```text
-Stage0｜Baseline
-结构：原始 baseline
+> 当前主线：`group tokenizer + time context v1 + target_cate_hist + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
 
-结果：
-valid best = 0.86224 | test = 0.8123
-
-结论：
-baseline 有明显 valid-test gap，说明 test 分布上缺少某些泛化信息。
-```
-
-
-
-```text
-Stage1｜Timestamp split 尝试
-结构：尝试用 timestamp 做数据划分，让 valid/test 分布更接近。
-
-结果：分布更接近，但 test 反而下降。
-
-结论：
-timestamp split 不是主方向，不能靠切分方式解决泛化问题。
-需要让模型显式学习时间上下文。
-```
+| 序号 | 模型 / 实验名     | 背景 / 动机                                       | 结构 / 变更                                             | 结果                          | 增幅 / 降幅                                | 结论                                    |
+| ---: | :---------------- | :------------------------------------------------ | :------------------------------------------------------ | :---------------------------- | :----------------------------------------- | :-------------------------------------- |
+|    0 | Baseline          | 建立原始参照。                                    | 原始 baseline                                           | valid 0.86224 / test 0.8123   | -                                          | valid-test gap 明显，需要泛化信息。     |
+|    1 | Timestamp split   | 怀疑 valid/test 时间分布不一致。                  | 按 timestamp 尝试重划分                                 | 分布更近，但 test 下降        | test 下降                                  | 不能靠切分解决，转向显式时间建模。      |
+|    2 | TS1               | 让模型直接看到时间上下文。                        | group + hybrid + time context                           | valid ≈0.8648 / test 0.8213   | vs baseline: valid +0.00256 / test +0.0090 | time context 是核心增益。               |
+|    3 | TS2               | 检查 hybrid compression 是否损失语义。            | 移除 hybrid，保留原始 group token                       | valid ≈0.8655 / test 0.820503 | vs TS1:    valid +0.0007 / test -0.000797  | 表达更强但更容易过拟合。                |
+|    4 | TS3               | 尝试更细地表达时间周期。                          | 更细粒度 time context                                   | valid 下降                    | valid 下降                                 | 丢弃。                                  |
+|    5 | TS2 Dropout       | valid 高但 test 不同步，怀疑时间特征过拟合。      | time context projection 加 dropout                      | 目标拉回 test                 | 待验证                                     | 轻量正则方向，后续被 cyclic time 替代。 |
+|    6 | Time Shift        | valid-test gap 更像时间状态偏移问题。             | 加强 temporal shift 视角                                | anchor delta 负收益           | test  -0.000543                            | 保留“时间状态/偏移”这个建模思路。       |
+|    7 | TS4               | 尝试补充 month 周期信号。                         | day/week 周期 + month 周期                              | 持平                          | 持平                                       | month 周期已删除，回到 v1 day/week 口径。 |
+|    8 | WLoss             | 尝试缓解少量异常样本带来的 loss 震荡。            | BCE linear reweight / tail negative downweight          | logloss 有收益但 AUC 不稳     | test 明显下降                              | 已删除模块，当前只保留 BCE / focal 入口。 |
+|    9 | Target Hist Match | 需要比 item_id 更泛化的 target/history 匹配信号。 | time context v1 + target/history semantic match + BCE   | 待重跑干净口径                | 待验证                                     | 当前 active 结构方向。                  |
 
 
 
-```text
-Stage2｜Group + Hybrid + Time Context（TS1模型）
-结构：
-从 timestamp 中提取周期时间特征：
-day / hour / week 等 sin-cos 特征。
-baseline + group + hybrid + time context token。
-建模方式：
-sin-cos 不作为离散 ID；
-而是作为连续 dense time feature：
-sin/cos -> Linear -> time embedding。
+## A / B 实验对照
 
-结果：         valid ≈ 0.8648 | test = 0.8213
-相对 baseline：valid +0.00256 | test +0.0090
+> 对照口径：`best valid` 按验证集 AUC 最高 epoch 统计。`相对 Best Test` = Test AUC - 当前已测试最优 Test AUC，当前 best = 0.821200。
 
-结论：
-时间特征应该作为 context 信息进入模型，而不是简单拼进原始 int feature。
-time context 是核心有效增益。
-valid 只小涨，但 test 大涨，说明时间上下文对 test 分布特别重要。
-TS1模型 成为当前真实 best。
-```
+| 实验 | 关键变更 | Best Valid AUC | Best Epoch | Test AUC | 相对 Best Test | 结论 |
+| :--- | :--- | ---: | ---: | ---: | ---: | :--- |
+| time context v1 + hybrid v1 | time context + hybrid 压缩 token | 0.864835 | 6 | **0.821200** | **+0.000000** | 当前已测试版本里 test 最好。 |
+| time context v1 | 移除 hybrid，保留原始 group token | **0.865527** | 5 | 0.820503 | -0.000697 | valid 最高，但 test 低于 hybrid，可能存在过拟合或 hybrid 有信息增强/正则效果。 |
+| time context v1 + anchor_time | 加入 anchor time 特征 | 0.864272 | 5 | 未测试 | - | valid 没超过 v1，不优先投入 test。 |
+| time context v1 + anchor_time + WLoss | anchor time + weighted loss | 0.864433 | 4 | 0.817130 | -0.004070 | anchor_time / WLoss 组合置信度不高。 |
+| time context v2 + WLoss | v2 time context + weighted loss | 0.864621 | 6 | 0.817673 | -0.003527 | valid 尚可，但 test 明显下降，排除。 |
+| time context v2 + WLoss + target_cate_hist | v2 + WLoss + target/history 类目匹配 | 0.863951 | 5 | 0.820517 | -0.000683 | target_cate_hist 对 test 有恢复信号，但 WLoss 拖累仍明显。 |
+| time context v2 | 纯 v2 time context | 0.864367 | 3 | 0.820265 | -0.000935 | 纯 v2 低于 v1 / v1 hybrid，暂不作为主线。 |
+| time context v2 + target_cate_hist | v2 + target/history 类目匹配，标准 BCE | 0.863920 | 5 | 未测试 | - | v2 本体已弱于 v1，是否继续测取决于是否单独验证 target_cate_hist。 |
 
+阶段判断：
 
+1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + BCE`。
+2. `time context v1` 的 clean 口径保留 day 内周期与 week 周期，不再包含 month 周期特征。
+3. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
+4. 下一步重点是重跑当前 clean 主线，对照 `time context v1` 与 `time context v1 + hybrid v1` 的已知 test 结果。
+
+<details>
+<summary>逐 epoch 原始记录</summary>
+
+### time context v1 + hybrid v1(压缩 token)
 
 ```text
-Stage3｜TS2：Remove Hybrid，保留原始 Group Token
-结构：
-baseline + group + time context
-移除 hybrid compression。
-
-动机：
-保留原始 semantic group ns token，避免 hybrid 压缩损失信息。
-
-结果：
-valid ≈ 0.8655
-test = 0.820503
-
-现象：
-valid 比 TS1 高：0.8648 -> 0.8655
-但 test 比 TS1 低：0.8213 -> 0.820503
-
-结论：
-remove hybrid 让表达能力更强，valid 更高；
-但也去掉了 hybrid 的隐式正则，导致更容易过拟合。
+Epoch 1 Validation | AUC: 0.8586019297422696, LogLoss: 0.22726713120937347
+Epoch 2 Validation | AUC: 0.8619686890806344, LogLoss: 0.22546328604221344
+Epoch 3 Validation | AUC: 0.8629913199261597, LogLoss: 0.22374865412712097
+Epoch 4 Validation | AUC: 0.8638795233353089, LogLoss: 0.22312286496162415
+Epoch 5 Validation | AUC: 0.8641831888086086, LogLoss: 0.22290949523448944
+Epoch 6 Validation | AUC: 0.86483510150465, LogLoss: 0.2222895622253418
+Epoch 7 Validation | AUC: 0.8644701238372491, LogLoss: 0.22245986759662628
+Test AUC: 0.8212
 ```
 
-
+### time context v1
 
 ```text
-Stage4｜TS3：更细粒度 Time Context 提取与融合
-结构：
-在 TS2 / time context 主线上继续优化时间上下文。
-
-核心变化：
-不再只是粗粒度 timestamp context；
-而是更细致拆分 day / week 等周期信息。
-
-结论：
-TS3 的目标是让 time context 表达更细，不只告诉模型“现在是什么时间”，而是同时表达日内周期、周内周期、长期周期等上下文。valid降低，丢弃。
+Epoch 1 Validation | AUC: 0.8589916953859507, LogLoss: 0.22725152969360352
+Epoch 2 Validation | AUC: 0.8634527978728386, LogLoss: 0.22394008934497833
+Epoch 3 Validation | AUC: 0.8643401958003973, LogLoss: 0.22323431074619293
+Epoch 4 Validation | AUC: 0.864563507016832, LogLoss: 0.22325144708156586
+Epoch 5 Validation | AUC: 0.8655272198441499, LogLoss: 0.22246094048023224
+Epoch 6 Validation | AUC: 0.8651004818893825, LogLoss: 0.22271838784217834
+Test AUC: 0.820503
 ```
 
-
+### time context v1 + anchor_time
 
 ```text
-Stage5｜ts2_dropout1：TS2 + Time Context Dropout
-结构：
-baseline + group + time context + remove hybrid
-在 TS2 基础上增加 time context dropout。
-
-动机：
-TS2 相比 TS1：
-valid 更高：0.8648 -> 0.8655
-test 更低：0.8213 -> 0.820503
-说明 remove hybrid 后，模型表达能力增强；
-但 hybrid 原本可能提供了一种隐式正则：
-1. 压缩 token 数量；
-2. 降低模型自由度；
-3. 减少对局部 group/time pattern 的过拟合。
-移除 hybrid 后，原始 group token 保留更完整，
-valid 上涨说明信息确实更充分；
-但 test 小降说明模型可能过拟合同分布 valid。
-
-新增：
-time context projection:
-Linear -> LayerNorm -> GELU -> Dropout
-
-原因：
-time context 是当前增益核心，也是最可能导致过拟合的强特征；
-先对 time token 做轻量正则，风险最低。
-
-结论：
-ts2_dropout1 是当前正在跑的主线。
-目标不是让 valid 继续变高，而是让 test 回到甚至超过 TS1 的 0.8213
+Epoch 1 Validation | AUC: 0.8597363938038884, LogLoss: 0.22645485401153564
+Epoch 2 Validation | AUC: 0.8628979220817063, LogLoss: 0.22362898290157318
+Epoch 3 Validation | AUC: 0.8638851144529702, LogLoss: 0.22310204803943634
+Epoch 4 Validation | AUC: 0.8642690700922193, LogLoss: 0.2226354479789734
+Epoch 5 Validation | AUC: 0.8642722816988574, LogLoss: 0.2229710966348648
+Epoch 6 Validation | AUC: 0.8638248450941041, LogLoss: 0.2230362445116043
+Test AUC: 未测试
 ```
 
-
+### time context v1 + anchor_time + WLoss
 
 ```text
-Stage6｜Time Shift Generalization：时间偏移视角下的泛化增强
-结构：
-baseline + group + time context
-在 ts2_dropout1 的基础上，继续围绕时间偏移/泛化能力做增强。
-
-核心假设：
-valid/test gap 不一定只是传统意义上的数据分布问题；
-更可能是 valid 中可被模型拟合的信息，和 test 真正需要的泛化信息之间存在 gap。
-
-也就是说：
-valid 可能包含更多同窗口、同分布、局部 pattern 或短期记忆信号；
-模型容量变强后，这些信号会抬高 valid；
-但这些信息到 test 上不稳定，导致 test 不同步上涨。
-
-对 timestamp 的重新理解：
-timestamp / time context 的价值，不只是告诉模型“样本发生在什么时间”；
-更重要的是引入一个时间偏移视角，让模型意识到 train -> valid/test 之间存在时间状态变化。
-
-因此 time context 可能起到两层作用：
-1. 提供周期性上下文，例如日内、周内行为差异；
-2. 作为 temporal shift indicator，帮助模型减少对局部记忆信号的依赖，提升跨时间泛化。
-
-下一步实验：
-在保留 ts2_dropout1 的 dropout 设定下，增强 time context 的表达，
-重点不是继续增加模型容量，而是更明确地表达时间偏移和时间状态。
-
-候选方向：
-- 加入绝对/相对时间趋势特征，弥补当前 sin-cos 只表达周期、不表达整体时间漂移的问题；
-- 保留 day/week sin-cos 周期特征；
-- 可尝试加入 coarse time bucket / normalized timestamp rank / weekend flag 等低维特征；
-- 暂时不要同时给所有其他 token generator 加 dropout，避免变量混在一起。
-
-目标：
-验证 gap 缩小是否来自 time context 对 temporal shift 的建模，
-而不仅是普通正则或数据切分变化。
+Epoch 1 Validation | AUC: 0.8597363938038884, LogLoss: 0.22645485401153564
+Epoch 2 Validation | AUC: 0.8628979220817063, LogLoss: 0.22362898290157318
+Epoch 3 Validation | AUC: 0.863855648383003, LogLoss: 0.22368547320365906
+Epoch 4 Validation | AUC: 0.8644325220230181, LogLoss: 0.22276438772678375
+Epoch 5 Validation | AUC: 0.8640272670172363, LogLoss: 0.22376228868961334
+Test AUC: 0.81713
 ```
 
-
+### time context v2 + WLoss
 
 ```text
-Stage7｜TS4：Enhanced Cyclic Time Context
-结构：
-baseline + group + enhanced time context
-去掉 fixed early anchor delta，只保留周期时间特征。
-
-当前 time context 使用 6 个周期特征：
-
-cyclic_tok = time_context_proj([
-    time_of_day_sin, time_of_day_cos,
-    day_of_week_sin, day_of_week_cos,
-    week_of_month_sin, week_of_month_cos,
-])
-time_tok = cyclic_tok
-
-实验结论：
-fixed early anchor delta 已验证会降低效果，当前代码已删除该分支和训练开关。
+Epoch 1 Validation | AUC: 0.8600489814930248, LogLoss: 0.22617894411087036
+Epoch 2 Validation | AUC: 0.8633769745178127, LogLoss: 0.22347073256969452
+Epoch 3 Validation | AUC: 0.8643799386857203, LogLoss: 0.22298479080200195
+Epoch 4 Validation | AUC: 0.8643418866056508, LogLoss: 0.2226429283618927
+Epoch 5 Validation | AUC: 0.8643592900049227, LogLoss: 0.2229812741279602
+Epoch 6 Validation | AUC: 0.86462094877141, LogLoss: 0.2228761613368988
+Epoch 7 Validation | AUC: 0.8637328860363889, LogLoss: 0.2235589623451233
+Test AUC: 0.817673
 ```
 
-
+### time context v2 + WLoss + target_cate_hist
 
 ```text
-Stage8｜TS5：BCE Linear Reweight 0.45-1.00
-结构：baseline + group + cyclic time context
-在周期 time context 结构基础上，不继续加大全局 dropout，
-而是在 loss 层根据逐样本 BCE 强度做线性降权。
-
-动机：
-当前训练中 logloss 和 loss 一直存在震荡。
-继续依赖 dropout 会全局削弱模型表达，尤其会同时影响正常样本和有效模式；
-但震荡更可能来自少量高 loss 样本对 BCE 梯度的放大。
-
-TS5 的目标不是让模型整体变弱，
-而是只降低中高强度异常样本对单步更新的影响，
-让主体样本继续按 BCE 正常学习。
-
-warmup：
-前 2 个 epoch 不做 reweight，仍然使用标准 BCE：
-
-epoch < 3:
-    loss = mean(loss_raw)
-
-从 epoch >= 3 开始启用线性降权。
-
-loss 定义：
-先计算逐样本 BCEWithLogits：
-
-loss_raw = BCEWithLogits(logits, label, reduction="none")
-
-再根据 loss_raw 强度计算连续权重：
-
-loss <= 0.45：正常样本，不降权，weight = 1.0
-0.45 < loss < 1.0：weight 从 1.0 线性下降到 0.2
-loss >= 1.0：明显异常，强降权，weight = 0.2
-
-权重曲线：
-loss = 0.45 -> weight = 1.00
-loss = 0.50 -> weight ≈ 0.93
-loss = 0.60 -> weight ≈ 0.78
-loss = 0.70 -> weight ≈ 0.64
-loss = 0.80 -> weight ≈ 0.49
-loss = 0.90 -> weight ≈ 0.35
-loss = 1.00 -> weight = 0.20
-
-loss = sum(loss_raw * weight) / sum(weight)
-
-实验开关：
---loss_type weighted_bce
---linear_reweight_start_loss 0.45
---linear_reweight_end_loss 1.0
---linear_reweight_min_weight 0.2
---linear_reweight_start_epoch 3
-
-训练日志：
-开启 reweight 后定期打印：
-loss > 0.45 的样本比例
-loss >= 1.0 的强异常样本比例
-当前 batch 的平均 weight
-
-当前定位：
-TS5 是 TS4 之后的 loss-stabilization 主线。
-它保留 TS4 的 cyclic time context，
-只改变训练目标的样本加权方式，不改变模型结构和推理路径。
-
-评估注意：
-validation logloss 仍然使用标准 BCEWithLogits 计算，
-因此 TS5 的 valid logloss 可以和之前实验直接比较。
-如果 TS5 有效，预期现象应该是训练 loss/logloss 震荡减弱，
-同时不需要通过继续增大 dropout 来压制异常梯度。
+Epoch 1 Validation | AUC: 0.8596292039203078, LogLoss: 0.22613340616226196
+Epoch 2 Validation | AUC: 0.8633862057822165, LogLoss: 0.22339412569999695
+Epoch 3 Validation | AUC: 0.8637153289275485, LogLoss: 0.22339175641536713
+Epoch 4 Validation | AUC: 0.863031826471035, LogLoss: 0.22375749051570892
+Epoch 5 Validation | AUC: 0.8639505697445576, LogLoss: 0.2231813669204712
+Epoch 6 Validation | AUC: 0.8631645978633322, LogLoss: 0.2258037030696869
+Test AUC: 0.820517
 ```
+
+### time context v2
 
 ```text
-Stage9｜Target Cate Match V1
-结构：baseline + group + cyclic time context + smooth weighted BCE + target cate match
-
-目标：
-给 target item 增加一组 target-aware history matching 特征。
-这里的 cate 表示与 target item_int_fid=13 对齐的历史 cate-like / semantic-id-like 离散特征，
-不假设其真实业务含义一定是类目，只利用其跨 target/history 的编码空间重叠关系。
-
-当前不使用 item_id / ID 类 repeat 特征，只保留 cate-like semantic matching 主线。
-这组特征会追加到 item_int_feats 末尾，并作为新的 I5_target_hist_match item NS group 接入；
-I1-I4 继续表示原始 target item 属性，I5 专门表示 target 与历史兴趣的匹配统计。
-
-当前根据字段 overlap 自动发现 target item 侧与历史行为侧可对齐的 item-side discrete semantic feature：
-target_cate_item_fid = 13
-seq_a history cate fid = 46
-seq_b history cate fid = 68
-seq_c history cate fid = 32
-seq_d history cate fid = 25
-
-该特征的价值不依赖人工语义命名：
-overlap 证明它和历史序列字段可对齐；
-可对齐就可以统计 target 与 history 的匹配强度；
-匹配强度本身就是用户兴趣相关信号。
-
-动态生成 4 个 synthetic item-int 特征：
-200001 target_cate_in_hist
-200002 target_cate_count_bucket
-200003 target_cate_ratio_bucket
-200004 target_cate_last_delta_bucket
-
-口径：
-只统计 sequence timestamp < 当前样本 timestamp 的历史行为。
-多路 sequence 会合并统计，但不生成 domain matching 特征。
-
-Bucket：
-target_cate_count_bucket: 0 / 1 / 2 / 3-5 / 6-10 / 10+
-target_cate_ratio_bucket: 0 / (0,0.1] / (0.1,0.3] / (0.3,0.5] / (0.5,1]
-target_cate_last_delta_bucket: never / <=1h / <=1d / <=7d / <=30d / >30d
-
-实验开关：
---use_target_hist_match
---target_hist_match_target_cate_item_fid 13
---target_hist_match_cate_seq_fids seq_a:46,seq_b:68,seq_c:32,seq_d:25
-
-结构注意：
-新增 I5 后 num_ns + 1。
-当前 group + time_context 配置下 T 从 21 变成 22；
-RankMixer full 下 run.sh 使用 d_model=88，满足 88 % 22 == 0。
-
-当前定位：
-Stage9 是当前 run.sh 的 active 结构版本。
-代码中仍然使用 --loss_type weighted_bce 这个入口，
-但 weighted_bce 的含义已经从旧版“按 BCE loss 线性降权”更新为：
-只对 label=0 且模型预测概率极高的负样本尾部做降权。
-
-动机：
-上一版 weighted BCE 观察到 valid logloss 下降，但 AUC 略降。
-这说明 reweight 确实缓解了高 loss / 毒点对 logloss 的影响，
-但阈值过早时会碰到一部分仍有排序价值的 hard negative / 高分边界样本，
-导致排序性能被轻微伤到。
-
-因此当前版本把降权区域从原先约 p=0.90~0.95 往后推，
-只处理更极端的负样本尾部。
-目标不是完全删除这些样本，而是把它们从“强监督信号”
-降级成“弱扰动信号”，避免单个极端负样本推翻模型已经学到的主模式：
-
-p <= 0.95:
-    weight = 1.0
-
-0.95 < p <= 0.99:
-    t = (p - 0.95) / (0.99 - 0.95)
-    weight = 1 - 0.95 * t
-
-p > 0.99:
-    weight = 0.01
-
-例如 label=0 且 p=0.99 时：
-raw_loss = -log(1 - 0.99) ≈ 4.605
-weight = 0.05
-weighted_loss ≈ 0.23
-
-这大致接近普通负样本 p=0.2 的 BCE 量级：
-loss = -log(1 - 0.2) ≈ 0.223
-
-因此极端错判负样本仍然参与训练，
-但只允许它对模型产生小幅扰动。
-
-核心假设：
-p < 0.95 的负样本可能包含 hard negative 和排序边界价值，不动。
-p >= 0.95 的负样本更像假负样本、归因噪声、延迟转化或异常毒点。
-p > 0.99 的负样本属于极端高置信冲突样本，直接强压到 min_weight。
-
-warmup：
-epoch < 3 使用标准 BCE，先让模型学习主模式。
-epoch >= 3 启用 tail negative downweight。
-
-loss 归一化：
-仍然使用加权归一化，避免因为某个 batch 毒点较多而整体缩小学习率：
-
-loss = sum(loss_raw * weight) / sum(weight)
-
-当前参数：
---loss_type weighted_bce
---tail_neg_p_start 0.95
---tail_neg_p_end 0.99
---tail_neg_end_weight 0.05
---tail_neg_min_weight 0.01
---tail_neg_gamma 1.0
---tail_neg_start_epoch 3
-
-训练日志：
-开启后定期打印：
-neg_ratio：batch 中负样本比例
-tail_ratio：label=0 且 p 在 (0.95, 0.99] 的样本比例
-ultra_ratio：label=0 且 p > 0.99 的样本比例
-neg_tail_ratio：负样本内部 tail 占比
-neg_ultra_ratio：负样本内部 ultra 占比
-avg_weight / avg_neg_weight：整体和负样本平均权重
-
-评估关注：
-如果该版本有效，预期现象是：
-1. valid AUC 相比旧线性 reweight 恢复或少降；
-2. valid logloss 继续保持稳定收益；
-3. tail_ratio / ultra_ratio 只占很小尾部，证明没有大面积削弱 hard negative。
+Epoch 1 Validation | AUC: 0.8600489814930248, LogLoss: 0.22617894411087036
+Epoch 2 Validation | AUC: 0.8633769745178127, LogLoss: 0.22347073256969452
+Epoch 3 Validation | AUC: 0.8643674719163711, LogLoss: 0.22294147312641144
+Epoch 4 Validation | AUC: 0.8642673092214735, LogLoss: 0.222646564245224
+Epoch 5 Validation | AUC: 0.8643459867948121, LogLoss: 0.22289179265499115
+Test AUC: 0.820265
 ```
 
+### time context v2 + target_cate_hist
 
+```text
+Epoch 1 Validation | AUC: 0.8596292039203078, LogLoss: 0.22613340616226196
+Epoch 2 Validation | AUC: 0.8633862057822165, LogLoss: 0.22339412569999695
+Epoch 3 Validation | AUC: 0.8637124220243307, LogLoss: 0.2233836054801941
+Epoch 4 Validation | AUC: 0.8630159748323187, LogLoss: 0.22374896705150604
+Epoch 5 Validation | AUC: 0.8639202791829825, LogLoss: 0.22301825881004333
+Epoch 6 Validation | AUC: 0.8635534825284971, LogLoss: 0.22504082322120667
+Test AUC: 未测试，怀疑v2不如v1
+```
 
-
-
-
-
-
-
+</details>
