@@ -74,14 +74,18 @@ def build_target_hist_match_config(args: argparse.Namespace) -> Dict[str, object
         )
 
     feature_fids = parse_int_list(args.target_hist_match_feature_fids)
-    if len(feature_fids) != 4:
-        raise ValueError("--target_hist_match_feature_fids must contain exactly 4 fids")
+    if len(feature_fids) not in (4, 16):
+        raise ValueError(
+            "--target_hist_match_feature_fids must contain either 4 legacy fids "
+            "or 16 target-state fids"
+        )
 
     return {
         "enabled": True,
         "target_cate_item_fid": args.target_hist_match_target_cate_item_fid,
         "hist_cate_seq_fids": parse_domain_fid_map(args.target_hist_match_cate_seq_fids),
         "feature_fids": feature_fids,
+        "recent_k": args.target_hist_match_recent_k,
     }
 
 
@@ -206,10 +210,18 @@ def parse_args() -> argparse.Namespace:
                              'seq_a:46,seq_b:68,seq_c:32,seq_d:25 '
                              '(required by --use_target_hist_match)')
     parser.add_argument('--target_hist_match_feature_fids', type=str,
-                        default='200001,200002,200003,200004',
+                        default='200001,200002,200003,200004,'
+                                '200005,200006,200007,'
+                                '200008,200009,200010,'
+                                '200011,200012,200013,'
+                                '200014,200015,200016',
                         help='Synthetic item-int fids for target category matching '
                              'features: cate_in_hist,cate_count_bucket,'
-                             'cate_ratio_bucket,cate_last_delta_bucket')
+                             'cate_ratio_bucket,cate_last_delta_bucket, followed by '
+                             'per-domain recent_rate,trend,last_delta buckets')
+    parser.add_argument('--target_hist_match_recent_k', type=int, default=64,
+                        help='Number of most-recent valid positions per domain used '
+                             'for target-category recent_rate/trend features')
     parser.add_argument('--use_recent_activity', action='store_true', default=False,
                         help='Append per-domain recent-activity bucket features '
                              'as synthetic user-int features')

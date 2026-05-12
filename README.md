@@ -208,6 +208,9 @@ Test AUC：
 Epoch 1 Validation | AUC: 0.8594209823124672, LogLoss: 0.2269304096698761
 Epoch 2 Validation | AUC: 0.8614140131662554, LogLoss: 0.22431623935699463
 Epoch 3 Validation | AUC: 0.86262498765924, LogLoss: 0.2241542786359787
+Epoch 4 Validation | AUC: 0.8636698162304017, LogLoss: 0.22304145991802216
+Epoch 5 Validation | AUC: 0.864176936142345, LogLoss: 0.2228860706090927
+Epoch 6 Validation | AUC: 0.8648499564753162, LogLoss: 0.22247886657714844
 Test AUC：
 ```
 
@@ -220,6 +223,21 @@ Epoch 3 Validation | AUC: 0.8633480901543749, LogLoss: 0.22415849566459656
 Epoch 4 Validation | AUC: 0.8631819692171463, LogLoss: 0.22339706122875214
 Epoch 5 Validation | AUC: 0.8644722725123479, LogLoss: 0.22297626733779907
 Epoch 6 Validation | AUC: 0.8640402758436504, LogLoss: 0.22322919964790344
+Test AUC：
+```
+
+### main_v2 (domain-only emb)
+
+```text
+
+Test AUC：
+```
+
+### main_v2_currentActive
+
+```text
+Epoch 1 Validation | AUC: 0.8612138892826436, LogLoss: 0.22549350559711456
+Epoch 2 Validation | AUC: 0.8633294657688486, LogLoss: 0.2236885130405426
 Test AUC：
 ```
 

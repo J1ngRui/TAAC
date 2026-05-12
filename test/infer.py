@@ -121,13 +121,17 @@ def build_target_hist_match_config(train_config: Dict[str, Any]) -> Dict[str, An
     if not train_config.get('use_target_hist_match', False):
         return {'enabled': False}
     feature_fids = _parse_int_list(
-        train_config.get('target_hist_match_feature_fids', '200001,200002,200003,200004')
+        train_config.get(
+            'target_hist_match_feature_fids',
+            '200001,200002,200003,200004',
+        )
     )
     return {
         'enabled': True,
         'target_cate_item_fid': train_config['target_hist_match_target_cate_item_fid'],
         'hist_cate_seq_fids': _parse_domain_fid_map(train_config['target_hist_match_cate_seq_fids']),
         'feature_fids': feature_fids,
+        'recent_k': train_config.get('target_hist_match_recent_k', 64),
     }
 
 
