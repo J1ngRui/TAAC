@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -1191,47 +1191,13 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
-class HybridNSTokenizer(nn.Module):
-    """Semantic-group tokenizer with learnable compression to fixed token count.
+class LearnableMixReMixer(nn.Module):
+    """Learnable static token re-mixing without changing token count."""
 
-    First builds one token per configured semantic group using
-    :class:`GroupNSTokenizer`, then softly aggregates those group tokens into a
-    fixed number of NS tokens. This keeps the ns_groups.json boundary meaningful
-    while still letting the caller choose a RankMixer-friendly token count.
-    """
-
-    def __init__(
-        self,
-        feature_specs: List[Tuple[int, int, int]],
-        groups: List[List[int]],
-        emb_dim: int,
-        d_model: int,
-        num_ns_tokens: int,
-        emb_skip_threshold: int = 0,
-    ) -> None:
+    def __init__(self, num_tokens: int, d_model: int) -> None:
         super().__init__()
-        if num_ns_tokens <= 0:
-            num_ns_tokens = len(groups)
-
-        self.group_tokenizer = GroupNSTokenizer(
-            feature_specs=feature_specs,
-            groups=groups,
-            emb_dim=emb_dim,
-            d_model=d_model,
-            emb_skip_threshold=emb_skip_threshold,
-        )
-        self.num_ns_tokens = num_ns_tokens
-        self.num_groups = len(groups)
-
-        # Compatibility aliases used by initialization / sparse reinit code.
-        self.feature_specs = self.group_tokenizer.feature_specs
-        self.groups = self.group_tokenizer.groups
-        self.emb_dim = self.group_tokenizer.emb_dim
-        self.emb_skip_threshold = self.group_tokenizer.emb_skip_threshold
-        self.embs = self.group_tokenizer.embs
-        self._emb_index = self.group_tokenizer._emb_index
-
-        self.mix_logits = nn.Parameter(torch.empty(num_ns_tokens, self.num_groups))
+        self.num_tokens = num_tokens
+        self.mix_logits = nn.Parameter(torch.empty(num_tokens, num_tokens))
         self.ffn_norm = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
@@ -1241,29 +1207,137 @@ class HybridNSTokenizer(nn.Module):
         self.out_norm = nn.LayerNorm(d_model)
         self._init_mix_logits()
 
-        logging.info(
-            f"HybridNSTokenizer: {self.num_groups} semantic groups -> "
-            f"{num_ns_tokens} NS tokens"
-        )
-
     def _init_mix_logits(self) -> None:
-        """Initialize compression as near-contiguous semantic partitions."""
         with torch.no_grad():
             self.mix_logits.fill_(-2.0)
-            for group_idx in range(self.num_groups):
-                token_idx = min(
-                    self.num_ns_tokens - 1,
-                    group_idx * self.num_ns_tokens // max(1, self.num_groups),
-                )
-                self.mix_logits[token_idx, group_idx] = 2.0
+            for idx in range(self.num_tokens):
+                self.mix_logits[idx, idx] = 2.0
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
-        """Build semantic group tokens, then compress them to fixed NS tokens."""
-        group_tokens = self.group_tokenizer(int_feats)  # (B, G, D)
-        weights = F.softmax(self.mix_logits, dim=-1)  # (K, G)
-        tokens = torch.einsum('kg,bgd->bkd', weights, group_tokens)
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.shape[1] != self.num_tokens:
+            raise ValueError(
+                f"LearnableMixReMixer expected {self.num_tokens} tokens, "
+                f"got {tokens.shape[1]}"
+            )
+        weights = F.softmax(self.mix_logits, dim=-1)  # (G, G)
+        tokens = torch.einsum('kg,bgd->bkd', weights, tokens)
         tokens = tokens + self.ffn(self.ffn_norm(tokens))
         return self.out_norm(tokens)
+
+
+class TokenSelfAttentionBlock(nn.Module):
+    """Self-attention interaction over tokens without changing token count."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.self_attn(tokens, tokens, tokens, need_weights=False)
+        tokens = self.attn_norm(tokens + self.dropout(attn_out))
+        ffn_out = self.ffn(tokens)
+        return self.out_norm(tokens + self.dropout(ffn_out))
+
+
+def create_token_remixer(
+    mode: str,
+    num_tokens: int,
+    d_model: int,
+    num_heads: int = 4,
+    dropout: float = 0.0,
+) -> nn.Module:
+    if mode == 'learnQ':
+        return LearnableMixReMixer(num_tokens=num_tokens, d_model=d_model)
+    if mode == 'self':
+        return TokenSelfAttentionBlock(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+    raise ValueError(f"Unknown hybrid mode: {mode}")
+
+
+class HybridNSTokenizer(nn.Module):
+    """Semantic-group tokenizer followed by token-count-preserving re-mixing.
+
+    First builds one token per configured semantic group using
+    :class:`GroupNSTokenizer`, then applies one hybrid token-modeling layer
+    while preserving the group token count.
+    """
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        num_ns_tokens: int = 0,
+        hybrid_mode: str = 'learnQ',
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        if num_ns_tokens > 0 and num_ns_tokens != len(groups):
+            logging.warning(
+                "HybridNSTokenizer preserves token count; ignoring "
+                f"num_ns_tokens={num_ns_tokens} and using num_groups={len(groups)}"
+            )
+
+        self.group_tokenizer = GroupNSTokenizer(
+            feature_specs=feature_specs,
+            groups=groups,
+            emb_dim=emb_dim,
+            d_model=d_model,
+            emb_skip_threshold=emb_skip_threshold,
+        )
+        self.num_ns_tokens = len(groups)
+        self.num_groups = len(groups)
+        self.hybrid_mode = hybrid_mode
+
+        # Compatibility aliases used by initialization / sparse reinit code.
+        self.feature_specs = self.group_tokenizer.feature_specs
+        self.groups = self.group_tokenizer.groups
+        self.emb_dim = self.group_tokenizer.emb_dim
+        self.emb_skip_threshold = self.group_tokenizer.emb_skip_threshold
+        self.embs = self.group_tokenizer.embs
+        self._emb_index = self.group_tokenizer._emb_index
+
+        self.remixer = create_token_remixer(
+            mode=hybrid_mode,
+            num_tokens=self.num_groups,
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+
+        logging.info(
+            f"HybridNSTokenizer: {self.num_groups} semantic groups -> "
+            f"{self.num_groups} NS tokens, mode={hybrid_mode}"
+        )
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Build semantic group tokens, then refine them without compression."""
+        group_tokens = self.group_tokenizer(int_feats)  # (B, G, D)
+        return self.remixer(group_tokens)
 
 
 class PCVRHyFormer(nn.Module):
@@ -1304,8 +1378,12 @@ class PCVRHyFormer(nn.Module):
         seq_id_threshold: int = 10000,
         use_time_context: bool = False,
         time_context_tz_offset_hours: float = 8.0,
-        # NS tokenizer variant
-        ns_tokenizer_type: str = 'rankmixer',
+        # Tokenizer variants
+        ns_tokenizer_type: str = 'group',
+        ns_hybrid_mode: str = 'learnQ',
+        s_tokenizer_type: str = 'none',
+        s_hybrid_mode: str = 'learnQ',
+        seq_max_lens: Optional[Union[str, Dict[str, int]]] = None,
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
     ) -> None:
@@ -1325,10 +1403,20 @@ class PCVRHyFormer(nn.Module):
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.ns_hybrid_mode = ns_hybrid_mode
+        self.s_tokenizer_type = s_tokenizer_type
+        self.s_hybrid_mode = s_hybrid_mode
+        self.seq_max_lens = self._parse_seq_max_lens(seq_max_lens)
+        self._hybrid_group_shapes_logged = False
+        self._last_ns_token_shapes: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
+        self._last_s_token_shapes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
 
         # ================== NS Tokens Construction ==================
 
-        if ns_tokenizer_type == 'group':
+        self.user_ns_hybrid = None
+        self.item_ns_hybrid = None
+
+        if ns_tokenizer_type in ('group', 'hybrid'):
             # Original: one NS token per group
             self.user_ns_tokenizer = GroupNSTokenizer(
                 feature_specs=user_int_feature_specs,
@@ -1347,6 +1435,21 @@ class PCVRHyFormer(nn.Module):
                 emb_skip_threshold=emb_skip_threshold,
             )
             num_item_ns = len(item_ns_groups)
+            if ns_tokenizer_type == 'hybrid':
+                self.user_ns_hybrid = create_token_remixer(
+                    mode=ns_hybrid_mode,
+                    num_tokens=num_user_ns,
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dropout=dropout_rate,
+                )
+                self.item_ns_hybrid = create_token_remixer(
+                    mode=ns_hybrid_mode,
+                    num_tokens=num_item_ns,
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dropout=dropout_rate,
+                )
         elif ns_tokenizer_type == 'rankmixer':
             # RankMixer paper style: all embeddings cat → split → project
             # 0 means auto: fall back to group count
@@ -1365,32 +1468,6 @@ class PCVRHyFormer(nn.Module):
             num_user_ns = user_ns_tokens
 
             self.item_ns_tokenizer = RankMixerNSTokenizer(
-                feature_specs=item_int_feature_specs,
-                groups=item_ns_groups,
-                emb_dim=emb_dim,
-                d_model=d_model,
-                num_ns_tokens=item_ns_tokens,
-                emb_skip_threshold=emb_skip_threshold,
-            )
-            num_item_ns = item_ns_tokens
-        elif ns_tokenizer_type == 'hybrid':
-            # Semantic groups first, then compress to a fixed token count.
-            # 0 means auto: fall back to group count.
-            if user_ns_tokens <= 0:
-                user_ns_tokens = len(user_ns_groups)
-            if item_ns_tokens <= 0:
-                item_ns_tokens = len(item_ns_groups)
-            self.user_ns_tokenizer = HybridNSTokenizer(
-                feature_specs=user_int_feature_specs,
-                groups=user_ns_groups,
-                emb_dim=emb_dim,
-                d_model=d_model,
-                num_ns_tokens=user_ns_tokens,
-                emb_skip_threshold=emb_skip_threshold,
-            )
-            num_user_ns = user_ns_tokens
-
-            self.item_ns_tokenizer = HybridNSTokenizer(
                 feature_specs=item_int_feature_specs,
                 groups=item_ns_groups,
                 emb_dim=emb_dim,
@@ -1488,6 +1565,20 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+
+        self.s_hybrid_blocks = nn.ModuleDict()
+        if s_tokenizer_type == 'hybrid':
+            for domain in self.seq_domains:
+                num_seq_tokens = self.seq_max_lens.get(domain, 256)
+                self.s_hybrid_blocks[domain] = create_token_remixer(
+                    mode=s_hybrid_mode,
+                    num_tokens=num_seq_tokens,
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dropout=dropout_rate,
+                )
+        elif s_tokenizer_type != 'none':
+            raise ValueError(f"Unknown s_tokenizer_type: {s_tokenizer_type}")
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1657,6 +1748,61 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
+    @staticmethod
+    def _parse_seq_max_lens(
+        seq_max_lens: Optional[Union[str, Dict[str, int]]]
+    ) -> Dict[str, int]:
+        if seq_max_lens is None:
+            return {}
+        if isinstance(seq_max_lens, dict):
+            return {str(k): int(v) for k, v in seq_max_lens.items()}
+        result: Dict[str, int] = {}
+        for pair in str(seq_max_lens).split(','):
+            if not pair.strip():
+                continue
+            domain, max_len = pair.split(':')
+            result[domain.strip()] = int(max_len.strip())
+        return result
+
+    @staticmethod
+    def _tensor_shape(tensor: torch.Tensor) -> Tuple[int, ...]:
+        return tuple(int(dim) for dim in tensor.shape)
+
+    def _apply_s_hybrid(self, domain: str, tokens: torch.Tensor) -> torch.Tensor:
+        input_shape = self._tensor_shape(tokens)
+        if self.s_tokenizer_type == 'hybrid':
+            tokens = self.s_hybrid_blocks[domain](tokens)
+        output_shape = self._tensor_shape(tokens)
+        self._last_s_token_shapes[domain] = (input_shape, output_shape)
+        return tokens
+
+    def _log_hybrid_group_shapes_once(self) -> None:
+        if self._hybrid_group_shapes_logged:
+            return
+        if self._last_ns_token_shapes is None:
+            return
+        if len(self._last_s_token_shapes) < self.num_sequences:
+            return
+
+        logging.info(
+            f"[HybridGroup] ns_tokenizer_type={self.ns_tokenizer_type}, "
+            f"ns_hybrid_mode={self.ns_hybrid_mode}"
+        )
+        logging.info(
+            f"[HybridGroup] s_tokenizer_type={self.s_tokenizer_type}, "
+            f"s_hybrid_mode={self.s_hybrid_mode}"
+        )
+        ns_in, ns_out = self._last_ns_token_shapes
+        logging.info(f"[HybridGroup] NS tokens: input={ns_in}, output={ns_out}")
+        s_shapes = "; ".join(
+            f"{domain}: input={self._last_s_token_shapes[domain][0]}, "
+            f"output={self._last_s_token_shapes[domain][1]}"
+            for domain in self.seq_domains
+        )
+        logging.info(f"[HybridGroup] S tokens: {s_shapes}")
+        logging.info("[HybridGroup] keep_token_count=True")
+        self._hybrid_group_shapes_logged = True
+
     def _embed_seq_domain(
         self,
         seq: torch.Tensor,
@@ -1731,19 +1877,40 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
-        ns_parts = [user_ns]
+        input_parts = [user_ns]
+        output_parts = []
+        if self.ns_tokenizer_type == 'hybrid':
+            if self.user_ns_hybrid is None or self.item_ns_hybrid is None:
+                raise RuntimeError("NS hybrid modules are not initialized")
+            user_ns_out = self.user_ns_hybrid(user_ns)
+            item_ns_out = self.item_ns_hybrid(item_ns)
+        else:
+            user_ns_out = user_ns
+            item_ns_out = item_ns
+
+        output_parts.append(user_ns_out)
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
+            input_parts.append(user_dense_tok)
+            output_parts.append(user_dense_tok)
+        input_parts.append(item_ns)
+        output_parts.append(item_ns_out)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
+            input_parts.append(item_dense_tok)
+            output_parts.append(item_dense_tok)
         if self.use_time_context:
             time_context_tok = self._build_time_context_token(inputs.timestamp).unsqueeze(1)
-            ns_parts.append(time_context_tok)
+            input_parts.append(time_context_tok)
+            output_parts.append(time_context_tok)
 
-        return torch.cat(ns_parts, dim=1)
+        ns_input = torch.cat(input_parts, dim=1)
+        ns_output = torch.cat(output_parts, dim=1)
+        self._last_ns_token_shapes = (
+            self._tensor_shape(ns_input),
+            self._tensor_shape(ns_output),
+        )
+        return ns_output
 
     def _run_multi_seq_blocks(
         self,
@@ -1809,9 +1976,12 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
+            tokens = self._apply_s_hybrid(domain, tokens)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+
+        self._log_hybrid_group_shapes_once()
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
@@ -1838,9 +2008,12 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
+            tokens = self._apply_s_hybrid(domain, tokens)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+
+        self._log_hybrid_group_shapes_once()
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 

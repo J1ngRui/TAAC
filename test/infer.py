@@ -3,10 +3,10 @@ evaluation container).
 
 Model construction mirrors ``train.py``: we rebuild the model from
 ``schema.json`` + ``ns_groups.json`` + ``train_config.json``. All model
-hyperparameters are resolved first from the ckpt directory's
-``train_config.json`` (written by ``trainer.py`` when saving a checkpoint),
-falling back to ``_FALLBACK_MODEL_CFG`` below (which must stay consistent
-with the CLI defaults in ``train.py``).
+hyperparameters are resolved from the ckpt directory's ``train_config.json``
+(written by ``trainer.py`` when saving a checkpoint). Missing training config
+is treated as a hard error so model structure cannot silently fall back to an
+unrelated experiment configuration.
 
 Only the Parquet data format is supported.
 
@@ -36,51 +36,40 @@ logging.basicConfig(
 )
 
 
-# Fallback values used only when ``train_config.json`` is missing from the
-# ckpt directory.
-#
-# These MUST match the argparse defaults in ``train.py``; otherwise once the
-# fallback path is actually taken the built model will shape-mismatch the
-# saved state_dict.
+# Model hyperparameter keys that must be present in ``train_config.json``.
 #
 # Special note on ``num_time_buckets``: this value is strictly determined by
 # ``dataset.BUCKET_BOUNDARIES`` and is NOT an independent hyperparameter.
-# When the feature is enabled we therefore use the constant exposed by the
-# dataset module; ``0`` means disabled.
-_FALLBACK_MODEL_CFG = {
-    'd_model': 64,
-    'emb_dim': 64,
-    'num_queries': 1,
-    'num_hyformer_blocks': 2,
-    'num_heads': 4,
-    'seq_encoder_type': 'transformer',
-    'hidden_mult': 4,
-    'dropout_rate': 0.01,
-    'seq_top_k': 50,
-    'seq_causal': False,
-    'action_num': 1,
-    'num_time_buckets': NUM_TIME_BUCKETS,
-    'rank_mixer_mode': 'full',
-    'use_rope': False,
-    'rope_base': 10000.0,
-    'emb_skip_threshold': 0,
-    'seq_id_threshold': 10000,
-    'use_time_context': False,
-    'time_context_tz_offset_hours': 8.0,
-    'ns_tokenizer_type': 'rankmixer',
-    'user_ns_tokens': 0,
-    'item_ns_tokens': 0,
-}
-
-_FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
-_FALLBACK_BATCH_SIZE = 256
-_FALLBACK_NUM_WORKERS = 16
-
-
-# Hyperparameter keys used to build the model. Everything else in
-# ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
-_MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
-
+# New-style training configs store ``use_time_buckets`` and inference derives
+# ``num_time_buckets`` from it; legacy configs may store ``num_time_buckets``.
+_MODEL_CFG_KEYS = [
+    'd_model',
+    'emb_dim',
+    'num_queries',
+    'num_hyformer_blocks',
+    'num_heads',
+    'seq_encoder_type',
+    'hidden_mult',
+    'dropout_rate',
+    'seq_top_k',
+    'seq_causal',
+    'action_num',
+    'num_time_buckets',
+    'rank_mixer_mode',
+    'use_rope',
+    'rope_base',
+    'emb_skip_threshold',
+    'seq_id_threshold',
+    'use_time_context',
+    'time_context_tz_offset_hours',
+    'ns_tokenizer_type',
+    'ns_hybrid_mode',
+    's_tokenizer_type',
+    's_hybrid_mode',
+    'seq_max_lens',
+    'user_ns_tokens',
+    'item_ns_tokens',
+]
 
 def build_feature_specs(
     schema: FeatureSchema,
@@ -96,13 +85,23 @@ def build_feature_specs(
     return specs
 
 
-def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
+def _parse_seq_max_lens(sml_str: Any) -> Dict[str, int]:
     """Parse a string like ``'seq_a:256,seq_b:256,...'`` into a dict."""
+    if isinstance(sml_str, dict):
+        return {str(k): int(v) for k, v in sml_str.items()}
     seq_max_lens: Dict[str, int] = {}
-    for pair in sml_str.split(','):
+    for pair in str(sml_str).split(','):
         k, v = pair.split(':')
         seq_max_lens[k.strip()] = int(v.strip())
     return seq_max_lens
+
+
+def _require_train_config_key(train_config: Dict[str, Any], key: str) -> Any:
+    if key not in train_config:
+        raise KeyError(
+            f"train_config missing required inference hyperparameter '{key}'"
+        )
+    return train_config[key]
 
 
 def _parse_int_list(value: str) -> List[int]:
@@ -136,8 +135,8 @@ def build_target_hist_match_config(train_config: Dict[str, Any]) -> Dict[str, An
 def load_train_config(model_dir: str) -> Dict[str, Any]:
     """Load ``train_config.json`` from the ckpt directory.
 
-    Returns an empty dict (which triggers fallback resolution) if the file is
-    not present.
+    The training config is the single source of truth for model structure; a
+    missing file is a hard error instead of falling back to local defaults.
     """
     train_config_path = os.path.join(model_dir, 'train_config.json')
     if os.path.exists(train_config_path):
@@ -145,26 +144,27 @@ def load_train_config(model_dir: str) -> Dict[str, Any]:
             cfg = json.load(f)
         logging.info(f"Loaded train_config from {train_config_path}")
         return cfg
-    logging.warning(
-        f"train_config.json not found in {model_dir}, "
-        f"falling back to hardcoded defaults. "
-        f"Shape mismatch may occur if training used non-default hyperparameters.")
-    return {}
+    raise FileNotFoundError(
+        f"train_config.json not found in {model_dir}. "
+        "Inference requires the training-time config to rebuild the exact model."
+    )
 
 
 def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract model hyperparameters from ``train_config``; missing keys fall
-    back to ``_FALLBACK_MODEL_CFG``.
+    """Extract model hyperparameters from ``train_config``.
+
+    Missing structural keys are hard errors. This prevents inference from
+    silently using a local default that belongs to a different experiment.
 
     Special handling for ``num_time_buckets``: it is not exposed on the CLI
     as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
+    by the length of ``dataset.BUCKET_BOUNDARIES``.
 
       1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
          -> use that value;
       2) ``train_config`` contains ``use_time_buckets`` (new-style training)
          -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
-      3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
+      3) neither is present -> raise.
     """
     cfg: Dict[str, Any] = {}
     for key in _MODEL_CFG_KEYS:
@@ -174,18 +174,18 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
             elif 'use_time_buckets' in train_config:
                 cfg[key] = NUM_TIME_BUCKETS if train_config['use_time_buckets'] else 0
             else:
-                cfg[key] = _FALLBACK_MODEL_CFG[key]
-                logging.warning(
-                    f"train_config missing both 'num_time_buckets' and 'use_time_buckets', "
-                    f"using fallback = {cfg[key]}")
+                raise KeyError(
+                    "train_config missing both 'num_time_buckets' and "
+                    "'use_time_buckets'; cannot rebuild model structure."
+                )
             continue
 
         if key in train_config:
             cfg[key] = train_config[key]
         else:
-            cfg[key] = _FALLBACK_MODEL_CFG[key]
-            logging.warning(
-                f"train_config missing '{key}', using fallback = {cfg[key]}")
+            raise KeyError(
+                f"train_config missing required model hyperparameter '{key}'"
+            )
     return cfg
 
 
@@ -376,7 +376,7 @@ def main() -> None:
     train_config = load_train_config(model_dir)
 
     # ---- Parse seq_max_lens ----
-    sml_str = train_config.get('seq_max_lens', _FALLBACK_SEQ_MAX_LENS)
+    sml_str = _require_train_config_key(train_config, 'seq_max_lens')
     seq_max_lens = _parse_seq_max_lens(sml_str)
     logging.info(f"seq_max_lens: {seq_max_lens}")
 
@@ -385,8 +385,8 @@ def main() -> None:
         logging.info(f"TargetHistMatchV1 enabled: {target_hist_match_config}")
 
     # ---- Data loading: reuse batch_size / num_workers from training config ----
-    batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
-    num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+    batch_size = int(_require_train_config_key(train_config, 'batch_size'))
+    num_workers = int(_require_train_config_key(train_config, 'num_workers'))
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,

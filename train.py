@@ -252,19 +252,30 @@ def parse_args() -> argparse.Namespace:
                              'each feature is placed in its own singleton group.')
 
     # NS tokenizer variant.
-    parser.add_argument('--ns_tokenizer_type', type=str, default='rankmixer',
+    parser.add_argument('--ns_tokenizer_type', type=str, default='group',
                         choices=['group', 'rankmixer', 'hybrid'],
                         help='NS tokenizer variant: '
                              'group = project each group to one token, '
                              'rankmixer = concatenate all embeddings then split into '
                              'equal-size chunks, '
-                             'hybrid = project semantic groups then compress to '
-                             'a tunable token count')
+                             'hybrid = group tokens followed by token-count-preserving '
+                             'hybrid token modeling')
+    parser.add_argument('--ns_hybrid_mode', type=str, default='learnQ',
+                        choices=['learnQ', 'self'],
+                        help='Hybrid mode for NS tokens when --ns_tokenizer_type=hybrid')
+    parser.add_argument('--s_tokenizer_type', type=str, default='none',
+                        choices=['none', 'hybrid'],
+                        help='S tokenizer variant: none = baseline sequence tokens, '
+                             'hybrid = per-domain sequence tokens followed by '
+                             'token-count-preserving hybrid token modeling')
+    parser.add_argument('--s_hybrid_mode', type=str, default='learnQ',
+                        choices=['learnQ', 'self'],
+                        help='Hybrid mode for S tokens when --s_tokenizer_type=hybrid')
     parser.add_argument('--user_ns_tokens', type=int, default=0,
-                        help='Number of user NS tokens in rankmixer/hybrid mode '
+                        help='Number of user NS tokens in rankmixer mode '
                              '(0 = automatically use the number of user groups)')
     parser.add_argument('--item_ns_tokens', type=int, default=0,
-                        help='Number of item NS tokens in rankmixer/hybrid mode '
+                        help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
 
     args = parser.parse_args()
@@ -402,6 +413,10 @@ def main() -> None:
         "use_time_context": args.use_time_context,
         "time_context_tz_offset_hours": args.time_context_tz_offset_hours,
         "ns_tokenizer_type": args.ns_tokenizer_type,
+        "ns_hybrid_mode": args.ns_hybrid_mode,
+        "s_tokenizer_type": args.s_tokenizer_type,
+        "s_hybrid_mode": args.s_hybrid_mode,
+        "seq_max_lens": seq_max_lens,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
     }

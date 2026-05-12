@@ -188,4 +188,55 @@ Epoch 6 Validation | AUC: 0.8635534825284971, LogLoss: 0.22504082322120667
 Test AUC: 未测试，怀疑v2不如v1
 ```
 
+### main_base (time context v2 + target_cate_hist)
+
+```text
+Epoch 1 Validation | AUC: 0.8585210768798079, LogLoss: 0.22774861752986908
+Epoch 2 Validation | AUC: 0.8624159969604134, LogLoss: 0.22399556636810303
+Epoch 3 Validation | AUC: 0.8636553398306517, LogLoss: 0.2231462150812149
+Epoch 4 Validation | AUC: 0.8638524590452423, LogLoss: 0.22316649556159973
+Epoch 5 Validation | AUC: 0.8640690200761034, LogLoss: 0.22374610602855682
+Epoch 6 Validation | AUC: 0.8636659023394101, LogLoss: 0.2229994684457779
+Test AUC：
+```
+
+### main_hybrid_ns_learnQ
+
+```text
+
+Test AUC：
+```
+
+### main_hybrid_ns_self
+
+```text
+Epoch 1 Validation | AUC: 0.8590003183298006, LogLoss: 0.2275124192237854
+Epoch 2 Validation | AUC: 0.8622379947623687, LogLoss: 0.22706498205661774
+Epoch 3 Validation | AUC: 0.8633480901543749, LogLoss: 0.22415849566459656
+Epoch 4 Validation | AUC: 0.8631819692171463, LogLoss: 0.22339706122875214
+Test AUC：
+```
+
+### main_hybrid_s_learnQ
+
+```text
+Epoch 1 Validation | AUC: 0.8574925833449455, LogLoss: 0.22773343324661255
+Epoch 2 Validation | AUC: 0.8596506933870137, LogLoss: 0.22557957470417023
+Epoch 3 Validation | AUC: 0.8608852033677096, LogLoss: 0.22601954638957977
+Epoch 4 Validation | AUC: 0.8614071619560183, LogLoss: 0.22492940723896027
+Test AUC：
+```
+
+### main_hybrid_s_self
+
+```text
+Epoch 1 Validation | AUC: 0.8587662876361789, LogLoss: 0.2275654524564743
+Epoch 2 Validation | AUC: 0.8626558360290371, LogLoss: 0.22388611733913422
+Epoch 3 Validation | AUC: 0.8639896912738863, LogLoss: 0.22293880581855774
+Epoch 4 Validation | AUC: 0.864320278190551, LogLoss: 0.22242768108844757
+Epoch 5 Validation | AUC: 0.8647177504952479, LogLoss: 0.22317512333393097
+Epoch 6 Validation | AUC: 0.8629874511160663, LogLoss: 0.22331075370311737
+Test AUC：
+```
+
 </details>
