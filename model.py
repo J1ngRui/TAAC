@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional
 
 
 class ModelInput(NamedTuple):
@@ -1381,9 +1381,6 @@ class PCVRHyFormer(nn.Module):
         # Tokenizer variants
         ns_tokenizer_type: str = 'group',
         ns_hybrid_mode: str = 'learnQ',
-        s_tokenizer_type: str = 'none',
-        s_hybrid_mode: str = 'learnQ',
-        seq_max_lens: Optional[Union[str, Dict[str, int]]] = None,
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
     ) -> None:
@@ -1404,12 +1401,8 @@ class PCVRHyFormer(nn.Module):
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
         self.ns_hybrid_mode = ns_hybrid_mode
-        self.s_tokenizer_type = s_tokenizer_type
-        self.s_hybrid_mode = s_hybrid_mode
-        self.seq_max_lens = self._parse_seq_max_lens(seq_max_lens)
         self._hybrid_group_shapes_logged = False
         self._last_ns_token_shapes: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
-        self._last_s_token_shapes: Dict[str, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {}
 
         # ================== NS Tokens Construction ==================
 
@@ -1565,20 +1558,6 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
-
-        self.s_hybrid_blocks = nn.ModuleDict()
-        if s_tokenizer_type == 'hybrid':
-            for domain in self.seq_domains:
-                num_seq_tokens = self.seq_max_lens.get(domain, 256)
-                self.s_hybrid_blocks[domain] = create_token_remixer(
-                    mode=s_hybrid_mode,
-                    num_tokens=num_seq_tokens,
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    dropout=dropout_rate,
-                )
-        elif s_tokenizer_type != 'none':
-            raise ValueError(f"Unknown s_tokenizer_type: {s_tokenizer_type}")
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1749,58 +1728,22 @@ class PCVRHyFormer(nn.Module):
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
     @staticmethod
-    def _parse_seq_max_lens(
-        seq_max_lens: Optional[Union[str, Dict[str, int]]]
-    ) -> Dict[str, int]:
-        if seq_max_lens is None:
-            return {}
-        if isinstance(seq_max_lens, dict):
-            return {str(k): int(v) for k, v in seq_max_lens.items()}
-        result: Dict[str, int] = {}
-        for pair in str(seq_max_lens).split(','):
-            if not pair.strip():
-                continue
-            domain, max_len = pair.split(':')
-            result[domain.strip()] = int(max_len.strip())
-        return result
-
-    @staticmethod
     def _tensor_shape(tensor: torch.Tensor) -> Tuple[int, ...]:
         return tuple(int(dim) for dim in tensor.shape)
-
-    def _apply_s_hybrid(self, domain: str, tokens: torch.Tensor) -> torch.Tensor:
-        input_shape = self._tensor_shape(tokens)
-        if self.s_tokenizer_type == 'hybrid':
-            tokens = self.s_hybrid_blocks[domain](tokens)
-        output_shape = self._tensor_shape(tokens)
-        self._last_s_token_shapes[domain] = (input_shape, output_shape)
-        return tokens
 
     def _log_hybrid_group_shapes_once(self) -> None:
         if self._hybrid_group_shapes_logged:
             return
         if self._last_ns_token_shapes is None:
             return
-        if len(self._last_s_token_shapes) < self.num_sequences:
-            return
 
         logging.info(
             f"[HybridGroup] ns_tokenizer_type={self.ns_tokenizer_type}, "
             f"ns_hybrid_mode={self.ns_hybrid_mode}"
         )
-        logging.info(
-            f"[HybridGroup] s_tokenizer_type={self.s_tokenizer_type}, "
-            f"s_hybrid_mode={self.s_hybrid_mode}"
-        )
         ns_in, ns_out = self._last_ns_token_shapes
         logging.info(f"[HybridGroup] NS tokens: input={ns_in}, output={ns_out}")
-        s_shapes = "; ".join(
-            f"{domain}: input={self._last_s_token_shapes[domain][0]}, "
-            f"output={self._last_s_token_shapes[domain][1]}"
-            for domain in self.seq_domains
-        )
-        logging.info(f"[HybridGroup] S tokens: {s_shapes}")
-        logging.info("[HybridGroup] keep_token_count=True")
+        logging.info("[HybridGroup] NS keep_token_count=True")
         self._hybrid_group_shapes_logged = True
 
     def _embed_seq_domain(
@@ -1976,7 +1919,6 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
-            tokens = self._apply_s_hybrid(domain, tokens)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2008,7 +1950,6 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
-            tokens = self._apply_s_hybrid(domain, tokens)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

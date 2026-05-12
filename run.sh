@@ -5,8 +5,6 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # ---- Active config: group + time context v1 + target-cate history match + BCE ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type group \
-    --s_tokenizer_type hybrid \
-    --s_hybrid_mode self \
     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
     --num_queries 2 \
     --use_time_context \
@@ -16,6 +14,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --target_hist_match_cate_seq_fids seq_a:46,seq_b:68,seq_c:32,seq_d:25 \
     --d_model 88 \
     --rank_mixer_mode full \
+    --use_rope \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --loss_type bce \
