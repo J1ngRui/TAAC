@@ -62,11 +62,10 @@ _MODEL_CFG_KEYS = [
     'seq_id_threshold',
     'use_time_context',
     'time_context_tz_offset_hours',
+    'time_context_dropout',
+    'domain_time_buckets',
     'ns_tokenizer_type',
     'ns_hybrid_mode',
-    's_tokenizer_type',
-    's_hybrid_mode',
-    'seq_max_lens',
     'user_ns_tokens',
     'item_ns_tokens',
 ]
@@ -182,6 +181,10 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
 
         if key in train_config:
             cfg[key] = train_config[key]
+        elif key == 'time_context_dropout':
+            cfg[key] = 0.0
+        elif key == 'domain_time_buckets':
+            cfg[key] = False
         else:
             raise KeyError(
                 f"train_config missing required model hyperparameter '{key}'"

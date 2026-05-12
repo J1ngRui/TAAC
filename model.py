@@ -1378,6 +1378,8 @@ class PCVRHyFormer(nn.Module):
         seq_id_threshold: int = 10000,
         use_time_context: bool = False,
         time_context_tz_offset_hours: float = 8.0,
+        time_context_dropout: float = 0.0,
+        domain_time_buckets: bool = False,
         # Tokenizer variants
         ns_tokenizer_type: str = 'group',
         ns_hybrid_mode: str = 'learnQ',
@@ -1399,6 +1401,8 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
+        self.time_context_dropout_rate = time_context_dropout
+        self.domain_time_buckets = domain_time_buckets
         self.ns_tokenizer_type = ns_tokenizer_type
         self.ns_hybrid_mode = ns_hybrid_mode
         self._hybrid_group_shapes_logged = False
@@ -1495,6 +1499,7 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
                 nn.GELU()
             )
+            self.time_context_dropout = nn.Dropout(time_context_dropout)
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
@@ -1561,7 +1566,13 @@ class PCVRHyFormer(nn.Module):
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
-            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+            if self.domain_time_buckets:
+                self.time_embeddings = nn.ModuleDict({
+                    domain: nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+                    for domain in self.seq_domains
+                })
+            else:
+                self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1650,8 +1661,13 @@ class PCVRHyFormer(nn.Module):
                 emb.weight.data[0, :] = 0
 
         if self.num_time_buckets > 0:
-            nn.init.xavier_normal_(self.time_embedding.weight.data)
-            self.time_embedding.weight.data[0, :] = 0
+            if self.domain_time_buckets:
+                for emb in self.time_embeddings.values():
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+            else:
+                nn.init.xavier_normal_(self.time_embedding.weight.data)
+                self.time_embedding.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1708,7 +1724,7 @@ class PCVRHyFormer(nn.Module):
 
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
-            skip_count += 1
+            skip_count += len(self.seq_domains) if self.domain_time_buckets else 1
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1748,6 +1764,7 @@ class PCVRHyFormer(nn.Module):
 
     def _embed_seq_domain(
         self,
+        domain: str,
         seq: torch.Tensor,
         sideinfo_embs: nn.ModuleList,
         proj: nn.Module,
@@ -1774,7 +1791,10 @@ class PCVRHyFormer(nn.Module):
 
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
-            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+            if self.domain_time_buckets:
+                token_emb = token_emb + self.time_embeddings[domain](time_bucket_ids)
+            else:
+                token_emb = token_emb + self.time_embedding(time_bucket_ids)
 
         return token_emb
 
@@ -1813,7 +1833,8 @@ class PCVRHyFormer(nn.Module):
     def _build_time_context_token(self, timestamp: torch.Tensor) -> torch.Tensor:
         """Build the time context token from cyclic timestamp features."""
         cyclic_feats = self._build_time_context_features(timestamp)
-        return self.time_context_proj(cyclic_feats)
+        time_token = self.time_context_proj(cyclic_feats)
+        return self.time_context_dropout(time_token)
 
     def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
         """Build all non-sequence tokens, including optional time context."""
@@ -1915,6 +1936,7 @@ class PCVRHyFormer(nn.Module):
         seq_masks_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
+                domain,
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
@@ -1946,6 +1968,7 @@ class PCVRHyFormer(nn.Module):
         seq_masks_list = []
         for domain in self.seq_domains:
             tokens = self._embed_seq_domain(
+                domain,
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],

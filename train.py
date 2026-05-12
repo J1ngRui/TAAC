@@ -175,6 +175,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
                         help='Timezone offset used for timestamp cyclic features '
                              '(default: 8.0 for UTC+8)')
+    parser.add_argument('--time_context_dropout', type=float, default=0.0,
+                        help='Dropout applied only to the current-time context token')
+    parser.add_argument('--domain_time_buckets', action='store_true', default=False,
+                        help='Use a separate sequence time-bucket embedding table per domain')
     parser.add_argument('--use_target_hist_match', action='store_true', default=False,
                         help='Append target-category/history-category matching bucket features '
                              'as a dedicated item NS group')
@@ -404,6 +408,8 @@ def main() -> None:
         "seq_id_threshold": args.seq_id_threshold,
         "use_time_context": args.use_time_context,
         "time_context_tz_offset_hours": args.time_context_tz_offset_hours,
+        "time_context_dropout": args.time_context_dropout,
+        "domain_time_buckets": args.domain_time_buckets,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "ns_hybrid_mode": args.ns_hybrid_mode,
         "user_ns_tokens": args.user_ns_tokens,

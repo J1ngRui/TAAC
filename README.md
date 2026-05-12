@@ -50,7 +50,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 ## TS / Time Context 优化 Timeline
 
-> 当前主线：`group tokenizer + time context v1 + target_cate_hist + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
+> 当前主线：`group tokenizer + time context v1 + target_cate_hist + domain_time_buckets + time_context_dropout=0.02 + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
 
 | 序号 | 模型 / 实验名     | 背景 / 动机                                       | 结构 / 变更                                             | 结果                          | 增幅 / 降幅                                | 结论                                    |
 | ---: | :---------------- | :------------------------------------------------ | :------------------------------------------------------ | :---------------------------- | :----------------------------------------- | :-------------------------------------- |
@@ -64,6 +64,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 |    7 | TS4               | 尝试补充 month 周期信号。                         | day/week 周期 + month 周期                              | 持平                          | 持平                                       | month 周期已删除，回到 v1 day/week 口径。 |
 |    8 | WLoss             | 尝试缓解少量异常样本带来的 loss 震荡。            | BCE linear reweight / tail negative downweight          | logloss 有收益但 AUC 不稳     | test 明显下降                              | 已删除模块，当前只保留 BCE / focal 入口。 |
 |    9 | Target Hist Match | 需要比 item_id 更泛化的 target/history 匹配信号。 | time context v1 + target/history semantic match + BCE   | 待重跑干净口径                | 待验证                                     | 当前 active 结构方向。                  |
+|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | 待训练                     | 待验证                                     | 当前 active 待验证版本。                |
 
 
 
@@ -84,7 +85,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 阶段判断：
 
-1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + BCE`。
+1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + domain_time_buckets + time_context_dropout=0.02 + BCE`。
 2. `time context v1` 的 clean 口径保留 day 内周期与 week 周期，不再包含 month 周期特征。
 3. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
 4. 下一步重点是重跑当前 clean 主线，对照 `time context v1` 与 `time context v1 + hybrid v1` 的已知 test 结果。

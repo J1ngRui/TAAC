@@ -9,6 +9,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --use_time_context \
     --time_context_tz_offset_hours 8 \
+    --time_context_dropout 0.02 \
+    --domain_time_buckets \
     --use_target_hist_match \
     --target_hist_match_target_cate_item_fid 13 \
     --target_hist_match_cate_seq_fids seq_a:46,seq_b:68,seq_c:32,seq_d:25 \
