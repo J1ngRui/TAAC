@@ -50,7 +50,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 ## TS / Time Context 优化 Timeline
 
-> 当前主线：`group tokenizer + time context v1 + target_cate_hist + domain_time_buckets + time_context_dropout=0.02 + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
+> 当前主线：`group tokenizer + time context v1 + target_cate_hist + domain_time_buckets + recent_activity + time_context_dropout=0.02 + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
 
 | 序号 | 模型 / 实验名     | 背景 / 动机                                       | 结构 / 变更                                             | 结果                          | 增幅 / 降幅                                | 结论                                    |
 | ---: | :---------------- | :------------------------------------------------ | :------------------------------------------------------ | :---------------------------- | :----------------------------------------- | :-------------------------------------- |
@@ -64,7 +64,8 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 |    7 | TS4               | 尝试补充 month 周期信号。                         | day/week 周期 + month 周期                              | 持平                          | 持平                                       | month 周期已删除，回到 v1 day/week 口径。 |
 |    8 | WLoss             | 尝试缓解少量异常样本带来的 loss 震荡。            | BCE linear reweight / tail negative downweight          | logloss 有收益但 AUC 不稳     | test 明显下降                              | 已删除模块，当前只保留 BCE / focal 入口。 |
 |    9 | Target Hist Match | 需要比 item_id 更泛化的 target/history 匹配信号。 | time context v1 + target/history semantic match + BCE   | 待重跑干净口径                | 待验证                                     | 当前 active 结构方向。                  |
-|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | 待训练                     | 待验证                                     | 当前 active 待验证版本。                |
+|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | 待训练                     | 待验证                                     | 作为 Recent Activity 版本基础。         |
+|   11 | Recent Activity   | 用户近期活跃度可能是强泛化信号。                  | 每路序列生成 last_delta / 1h / 1d / 7d count bucket，追加到最后一个 user NS group | 待训练 | 待验证 | 不新增 token，保持 `T=22,d_model=88`。 |
 
 
 
@@ -85,7 +86,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 阶段判断：
 
-1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + domain_time_buckets + time_context_dropout=0.02 + BCE`。
+1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + domain_time_buckets + recent_activity + time_context_dropout=0.02 + BCE`。
 2. `time context v1` 的 clean 口径保留 day 内周期与 week 周期，不再包含 month 周期特征。
 3. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
 4. 下一步重点是重跑当前 clean 主线，对照 `time context v1` 与 `time context v1 + hybrid v1` 的已知 test 结果。
@@ -204,7 +205,9 @@ Test AUC：
 ### main_hybrid_ns_learnQ
 
 ```text
-
+Epoch 1 Validation | AUC: 0.8594209823124672, LogLoss: 0.2269304096698761
+Epoch 2 Validation | AUC: 0.8614140131662554, LogLoss: 0.22431623935699463
+Epoch 3 Validation | AUC: 0.86262498765924, LogLoss: 0.2241542786359787
 Test AUC：
 ```
 
@@ -218,28 +221,6 @@ Epoch 4 Validation | AUC: 0.8631819692171463, LogLoss: 0.22339706122875214
 Epoch 5 Validation | AUC: 0.8644722725123479, LogLoss: 0.22297626733779907
 Epoch 6 Validation | AUC: 0.8640402758436504, LogLoss: 0.22322919964790344
 Test AUC：
-```
-
-### main_hybrid_s_learnQ
-
-```text
-Epoch 1 Validation | AUC: 0.8574925833449455, LogLoss: 0.22773343324661255
-Epoch 2 Validation | AUC: 0.8596506933870137, LogLoss: 0.22557957470417023
-Epoch 3 Validation | AUC: 0.8608852033677096, LogLoss: 0.22601954638957977
-Epoch 4 Validation | AUC: 0.8614071619560183, LogLoss: 0.22492940723896027
-Test AUC：
-```
-
-### main_hybrid_s_self
-
-```text
-Epoch 1 Validation | AUC: 0.8587662876361789, LogLoss: 0.2275654524564743
-Epoch 2 Validation | AUC: 0.8626558360290371, LogLoss: 0.22388611733913422
-Epoch 3 Validation | AUC: 0.8639896912738863, LogLoss: 0.22293880581855774
-Epoch 4 Validation | AUC: 0.864320278190551, LogLoss: 0.22242768108844757
-Epoch 5 Validation | AUC: 0.8647177504952479, LogLoss: 0.22317512333393097
-Epoch 6 Validation | AUC: 0.8629874511160663, LogLoss: 0.22331075370311737
-Test AUC：auc: 0.815949
 ```
 
 </details>

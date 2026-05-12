@@ -131,6 +131,28 @@ def build_target_hist_match_config(train_config: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def build_recent_activity_config(train_config: Dict[str, Any]) -> Dict[str, Any]:
+    if not train_config.get('use_recent_activity', False):
+        return {'enabled': False}
+    feature_fids = _parse_int_list(
+        train_config.get(
+            'recent_activity_feature_fids',
+            '210001,210002,210003,210004,'
+            '210005,210006,210007,210008,'
+            '210009,210010,210011,210012,'
+            '210013,210014,210015,210016',
+        )
+    )
+    windows_seconds = _parse_int_list(
+        train_config.get('recent_activity_windows_seconds', '3600,86400,604800')
+    )
+    return {
+        'enabled': True,
+        'feature_fids': feature_fids,
+        'windows_seconds': windows_seconds,
+    }
+
+
 def load_train_config(model_dir: str) -> Dict[str, Any]:
     """Load ``train_config.json`` from the ckpt directory.
 
@@ -244,13 +266,41 @@ def build_model(
             ) from exc
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
-        user_ns_groups = [[i] for i in range(len(dataset.user_int_schema.entries))]
+        recent_activity_fids = set(dataset.recent_activity_feature_ids)
+        user_ns_groups = [
+            [i]
+            for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)
+            if fid not in recent_activity_fids
+        ]
         target_match_fids = set(dataset.target_hist_match_feature_ids)
         item_ns_groups = [
             [i]
             for i, (fid, _, _) in enumerate(dataset.item_int_schema.entries)
             if fid not in target_match_fids
         ]
+
+    if getattr(dataset, 'use_recent_activity', False):
+        user_fid_to_idx = {
+            fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)
+        }
+        recent_group = [
+            user_fid_to_idx[fid]
+            for fid in dataset.recent_activity_feature_ids
+        ]
+        if user_ns_groups:
+            user_ns_groups[-1].extend(idx for idx in recent_group if idx not in user_ns_groups[-1])
+            logging.info(
+                "Appended RecentActivityV1 user features to last user NS group: fids=%s, indices=%s",
+                dataset.recent_activity_feature_ids,
+                recent_group,
+            )
+        else:
+            user_ns_groups.append(recent_group)
+            logging.info(
+                "Added RecentActivityV1 user NS group with fids=%s, indices=%s",
+                dataset.recent_activity_feature_ids,
+                recent_group,
+            )
 
     if getattr(dataset, 'use_target_hist_match', False):
         item_fid_to_idx = {
@@ -386,6 +436,9 @@ def main() -> None:
     target_hist_match_config = build_target_hist_match_config(train_config)
     if target_hist_match_config.get('enabled', False):
         logging.info(f"TargetHistMatchV1 enabled: {target_hist_match_config}")
+    recent_activity_config = build_recent_activity_config(train_config)
+    if recent_activity_config.get('enabled', False):
+        logging.info(f"RecentActivityV1 enabled: {recent_activity_config}")
 
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(_require_train_config_key(train_config, 'batch_size'))
@@ -397,6 +450,7 @@ def main() -> None:
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
         target_hist_match_config=target_hist_match_config,
+        recent_activity_config=recent_activity_config,
         shuffle=False,
         buffer_batches=0,
         is_training=False,

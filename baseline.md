@@ -262,3 +262,36 @@ self.ffn = nn.Sequential(
 1. 会丢掉全量历史位置级别的 token 数量，只保留 `top_k` 个承载位置。
 2. 如果远期历史很重要，压缩可能造成信息损失。
 3. 行为比 `transformer` 更复杂，调参时需要关注 `seq_top_k` 和 `seq_causal`。
+
+
+
+## 三、Query Generator
+
+它的作用是给每一路历史序列生成固定数量的初始 Query token。后续 block 里，这些 Query token 会去 attend 对应 sequence domain 的 S token，从该路历史中读取信息。
+
+**每一路序列单独生成自己的 Query token**。
+每一路都共享同一份 NS 上下文，但只拼接自己这一路的 pooled S 表达。
+
+对第 `i` 路 sequence，处理流程是：
+
+1. 将 NS tokens 在 token 维度上 flatten。
+2. 对第 `i` 路 S tokens 做 mask mean pooling，忽略 padding 位置。
+3. 将 `ns_flat` 和 `seq_pooled_i` concat 成 `global_info_i`。
+4. 对 `global_info_i` 做 LayerNorm。
+5. 使用 `num_queries` 个独立 MLP 分别生成 `num_queries` 个 Query token。
+6. 将这些 Query token stack 成该路的 `Q_i`。
+
+需要注意的是，两个 Query token 来自同一个 `global_info_i`，但经过两个独立 MLP：
+
+```text
+global_info_i -> MLP_i_1 -> query_i_1
+global_info_i -> MLP_i_2 -> query_i_2
+
+Q_i = stack([query_i_1, query_i_2]) [num_query,d_model]
+
+后面进入 RankMixer 前会把四路 decoded Q 拼起来：
+all_Q: (B, 8, 88)
+```
+
+因此 baseline 里 `num_queries=2` 表示给每一路历史提供两个可学习的查询槽位。代码没有显式规定这两个 Query 分别代表长期兴趣、短期兴趣或 target-aware 兴趣；它们是否学出不同关注角度，主要由独立参数初始化和后续 cross attention / RankMixer 的训练信号决定。
+

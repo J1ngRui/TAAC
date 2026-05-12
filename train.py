@@ -85,6 +85,22 @@ def build_target_hist_match_config(args: argparse.Namespace) -> Dict[str, object
     }
 
 
+def build_recent_activity_config(args: argparse.Namespace) -> Dict[str, object]:
+    """Build optional recent-activity feature config for the dataset."""
+    if not args.use_recent_activity:
+        return {"enabled": False}
+
+    feature_fids = parse_int_list(args.recent_activity_feature_fids)
+    windows_seconds = parse_int_list(args.recent_activity_windows_seconds)
+    if not windows_seconds:
+        raise ValueError("--recent_activity_windows_seconds must not be empty")
+    return {
+        "enabled": True,
+        "feature_fids": feature_fids,
+        "windows_seconds": windows_seconds,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
@@ -194,6 +210,21 @@ def parse_args() -> argparse.Namespace:
                         help='Synthetic item-int fids for target category matching '
                              'features: cate_in_hist,cate_count_bucket,'
                              'cate_ratio_bucket,cate_last_delta_bucket')
+    parser.add_argument('--use_recent_activity', action='store_true', default=False,
+                        help='Append per-domain recent-activity bucket features '
+                             'as synthetic user-int features')
+    parser.add_argument('--recent_activity_feature_fids', type=str,
+                        default='210001,210002,210003,210004,'
+                                '210005,210006,210007,210008,'
+                                '210009,210010,210011,210012,'
+                                '210013,210014,210015,210016',
+                        help='Synthetic user-int fids for recent activity features. '
+                             'For each sequence domain: last_delta_bucket, '
+                             'recent_1h_count_bucket, recent_1d_count_bucket, '
+                             'recent_7d_count_bucket')
+    parser.add_argument('--recent_activity_windows_seconds', type=str,
+                        default='3600,86400,604800',
+                        help='Comma-separated recent-count windows in seconds')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -321,6 +352,9 @@ def main() -> None:
     target_hist_match_config = build_target_hist_match_config(args)
     if target_hist_match_config.get("enabled", False):
         logging.info(f"TargetHistMatchV1 enabled: {target_hist_match_config}")
+    recent_activity_config = build_recent_activity_config(args)
+    if recent_activity_config.get("enabled", False):
+        logging.info(f"RecentActivityV1 enabled: {recent_activity_config}")
 
     logging.info("Using Parquet data format (IterableDataset)")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
@@ -334,6 +368,7 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         target_hist_match_config=target_hist_match_config,
+        recent_activity_config=recent_activity_config,
     )
 
     # ---- NS groups ----
@@ -349,7 +384,16 @@ def main() -> None:
         logging.info(f"Item NS groups ({len(item_ns_groups)}): {list(ns_groups_cfg['item_ns_groups'].keys())}")
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
-        user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
+        recent_activity_fids = set(
+            recent_activity_config.get("feature_fids", [])
+            if recent_activity_config.get("enabled", False)
+            else []
+        )
+        user_ns_groups = [
+            [i]
+            for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)
+            if fid not in recent_activity_fids
+        ]
         target_match_fids = set(
             target_hist_match_config.get("feature_fids", [])
             if target_hist_match_config.get("enabled", False)
@@ -360,6 +404,27 @@ def main() -> None:
             for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)
             if fid not in target_match_fids
         ]
+
+    if recent_activity_config.get("enabled", False):
+        user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
+        recent_group = [
+            user_fid_to_idx[fid]
+            for fid in recent_activity_config["feature_fids"]  # type: ignore[index]
+        ]
+        if user_ns_groups:
+            user_ns_groups[-1].extend(idx for idx in recent_group if idx not in user_ns_groups[-1])
+            logging.info(
+                "Appended RecentActivityV1 user features to last user NS group: fids=%s, indices=%s",
+                recent_activity_config["feature_fids"],
+                recent_group,
+            )
+        else:
+            user_ns_groups.append(recent_group)
+            logging.info(
+                "Added RecentActivityV1 user NS group with fids=%s, indices=%s",
+                recent_activity_config["feature_fids"],
+                recent_group,
+            )
 
     if target_hist_match_config.get("enabled", False):
         item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
