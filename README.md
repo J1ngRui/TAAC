@@ -50,7 +50,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 ## TS / Time Context 优化 Timeline
 
-> 当前主线：`group tokenizer + time context v1 + target_cate_hist + domain_time_buckets + recent_activity + time_context_dropout=0.02 + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
+> 当前主线：`group tokenizer + time context v1 + target_cate_hist + recent_activity + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
 
 | 序号 | 模型 / 实验名     | 背景 / 动机                                       | 结构 / 变更                                             | 结果                          | 增幅 / 降幅                                | 结论                                    |
 | ---: | :---------------- | :------------------------------------------------ | :------------------------------------------------------ | :---------------------------- | :----------------------------------------- | :-------------------------------------- |
@@ -64,7 +64,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 |    7 | TS4               | 尝试补充 month 周期信号。                         | day/week 周期 + month 周期                              | 持平                          | 持平                                       | month 周期已删除，回到 v1 day/week 口径。 |
 |    8 | WLoss             | 尝试缓解少量异常样本带来的 loss 震荡。            | BCE linear reweight / tail negative downweight          | logloss 有收益但 AUC 不稳     | test 明显下降                              | 已删除模块，当前只保留 BCE / focal 入口。 |
 |    9 | Target Hist Match | 需要比 item_id 更泛化的 target/history 匹配信号。 | time context v1 + target/history semantic match + BCE   | 待重跑干净口径                | 待验证                                     | 当前 active 结构方向。                  |
-|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | 待训练                     | 待验证                                     | 作为 Recent Activity 版本基础。         |
+|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | 待训练                     | 待验证                                     | 已从当前主线回退。                      |
 |   11 | Recent Activity   | 用户近期活跃度可能是强泛化信号。                  | 每路序列生成 last_delta / 1h / 1d / 7d count bucket，追加到最后一个 user NS group | 待训练 | 待验证 | 不新增 token，保持 `T=22,d_model=88`。 |
 
 
@@ -86,7 +86,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 阶段判断：
 
-1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + domain_time_buckets + recent_activity + time_context_dropout=0.02 + BCE`。
+1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + recent_activity + BCE`。
 2. `time context v1` 的 clean 口径保留 day 内周期与 week 周期，不再包含 month 周期特征。
 3. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
 4. 下一步重点是重跑当前 clean 主线，对照 `time context v1` 与 `time context v1 + hybrid v1` 的已知 test 结果。
@@ -94,135 +94,141 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 <details>
 <summary>逐 epoch 原始记录</summary>
 
-### time context v1 + hybrid v1(压缩 token)
+### time context v1 + compressed hybrid v1
 
 ```text
-Epoch 1 Validation | AUC: 0.8586019297422696, LogLoss: 0.22726713120937347
-Epoch 2 Validation | AUC: 0.8619686890806344, LogLoss: 0.22546328604221344
-Epoch 3 Validation | AUC: 0.8629913199261597, LogLoss: 0.22374865412712097
-Epoch 4 Validation | AUC: 0.8638795233353089, LogLoss: 0.22312286496162415
-Epoch 5 Validation | AUC: 0.8641831888086086, LogLoss: 0.22290949523448944
-Epoch 6 Validation | AUC: 0.86483510150465, LogLoss: 0.2222895622253418
-Epoch 7 Validation | AUC: 0.8644701238372491, LogLoss: 0.22245986759662628
-Test AUC: 0.8212
+Epoch 1 Validation | AUC: 0.858602, LogLoss: 0.227267
+Epoch 2 Validation | AUC: 0.861969, LogLoss: 0.225463
+Epoch 3 Validation | AUC: 0.862991, LogLoss: 0.223749
+Epoch 4 Validation | AUC: 0.863880, LogLoss: 0.223123
+Epoch 5 Validation | AUC: 0.864183, LogLoss: 0.222909
+Epoch 6 Validation | AUC: 0.864835, LogLoss: 0.222290
+Epoch 7 Validation | AUC: 0.864470, LogLoss: 0.222460
+Test AUC: 0.821200
 ```
 
 ### time context v1
 
 ```text
-Epoch 1 Validation | AUC: 0.8589916953859507, LogLoss: 0.22725152969360352
-Epoch 2 Validation | AUC: 0.8634527978728386, LogLoss: 0.22394008934497833
-Epoch 3 Validation | AUC: 0.8643401958003973, LogLoss: 0.22323431074619293
-Epoch 4 Validation | AUC: 0.864563507016832, LogLoss: 0.22325144708156586
-Epoch 5 Validation | AUC: 0.8655272198441499, LogLoss: 0.22246094048023224
-Epoch 6 Validation | AUC: 0.8651004818893825, LogLoss: 0.22271838784217834
+Epoch 1 Validation | AUC: 0.858992, LogLoss: 0.227252
+Epoch 2 Validation | AUC: 0.863453, LogLoss: 0.223940
+Epoch 3 Validation | AUC: 0.864340, LogLoss: 0.223234
+Epoch 4 Validation | AUC: 0.864564, LogLoss: 0.223251
+Epoch 5 Validation | AUC: 0.865527, LogLoss: 0.222461
+Epoch 6 Validation | AUC: 0.865100, LogLoss: 0.222718
 Test AUC: 0.820503
 ```
 
 ### time context v1 + anchor_time
 
 ```text
-Epoch 1 Validation | AUC: 0.8597363938038884, LogLoss: 0.22645485401153564
-Epoch 2 Validation | AUC: 0.8628979220817063, LogLoss: 0.22362898290157318
-Epoch 3 Validation | AUC: 0.8638851144529702, LogLoss: 0.22310204803943634
-Epoch 4 Validation | AUC: 0.8642690700922193, LogLoss: 0.2226354479789734
-Epoch 5 Validation | AUC: 0.8642722816988574, LogLoss: 0.2229710966348648
-Epoch 6 Validation | AUC: 0.8638248450941041, LogLoss: 0.2230362445116043
+Epoch 1 Validation | AUC: 0.859736, LogLoss: 0.226455
+Epoch 2 Validation | AUC: 0.862898, LogLoss: 0.223629
+Epoch 3 Validation | AUC: 0.863885, LogLoss: 0.223102
+Epoch 4 Validation | AUC: 0.864269, LogLoss: 0.222635
+Epoch 5 Validation | AUC: 0.864272, LogLoss: 0.222971
+Epoch 6 Validation | AUC: 0.863825, LogLoss: 0.223036
 Test AUC: 未测试
 ```
 
 ### time context v1 + anchor_time + WLoss
 
 ```text
-Epoch 1 Validation | AUC: 0.8597363938038884, LogLoss: 0.22645485401153564
-Epoch 2 Validation | AUC: 0.8628979220817063, LogLoss: 0.22362898290157318
-Epoch 3 Validation | AUC: 0.863855648383003, LogLoss: 0.22368547320365906
-Epoch 4 Validation | AUC: 0.8644325220230181, LogLoss: 0.22276438772678375
-Epoch 5 Validation | AUC: 0.8640272670172363, LogLoss: 0.22376228868961334
-Test AUC: 0.81713
+Epoch 1 Validation | AUC: 0.859736, LogLoss: 0.226455
+Epoch 2 Validation | AUC: 0.862898, LogLoss: 0.223629
+Epoch 3 Validation | AUC: 0.863856, LogLoss: 0.223685
+Epoch 4 Validation | AUC: 0.864433, LogLoss: 0.222764
+Epoch 5 Validation | AUC: 0.864027, LogLoss: 0.223762
+Test AUC: 0.817130
 ```
 
 ### time context v2 + WLoss
 
 ```text
-Epoch 1 Validation | AUC: 0.8600489814930248, LogLoss: 0.22617894411087036
-Epoch 2 Validation | AUC: 0.8633769745178127, LogLoss: 0.22347073256969452
-Epoch 3 Validation | AUC: 0.8643799386857203, LogLoss: 0.22298479080200195
-Epoch 4 Validation | AUC: 0.8643418866056508, LogLoss: 0.2226429283618927
-Epoch 5 Validation | AUC: 0.8643592900049227, LogLoss: 0.2229812741279602
-Epoch 6 Validation | AUC: 0.86462094877141, LogLoss: 0.2228761613368988
-Epoch 7 Validation | AUC: 0.8637328860363889, LogLoss: 0.2235589623451233
+Epoch 1 Validation | AUC: 0.860049, LogLoss: 0.226179
+Epoch 2 Validation | AUC: 0.863377, LogLoss: 0.223471
+Epoch 3 Validation | AUC: 0.864380, LogLoss: 0.222985
+Epoch 4 Validation | AUC: 0.864342, LogLoss: 0.222643
+Epoch 5 Validation | AUC: 0.864359, LogLoss: 0.222981
+Epoch 6 Validation | AUC: 0.864621, LogLoss: 0.222876
+Epoch 7 Validation | AUC: 0.863733, LogLoss: 0.223559
 Test AUC: 0.817673
 ```
 
 ### time context v2 + WLoss + target_cate_hist
 
 ```text
-Epoch 1 Validation | AUC: 0.8596292039203078, LogLoss: 0.22613340616226196
-Epoch 2 Validation | AUC: 0.8633862057822165, LogLoss: 0.22339412569999695
-Epoch 3 Validation | AUC: 0.8637153289275485, LogLoss: 0.22339175641536713
-Epoch 4 Validation | AUC: 0.863031826471035, LogLoss: 0.22375749051570892
-Epoch 5 Validation | AUC: 0.8639505697445576, LogLoss: 0.2231813669204712
-Epoch 6 Validation | AUC: 0.8631645978633322, LogLoss: 0.2258037030696869
+Epoch 1 Validation | AUC: 0.859629, LogLoss: 0.226133
+Epoch 2 Validation | AUC: 0.863386, LogLoss: 0.223394
+Epoch 3 Validation | AUC: 0.863715, LogLoss: 0.223392
+Epoch 4 Validation | AUC: 0.863032, LogLoss: 0.223757
+Epoch 5 Validation | AUC: 0.863951, LogLoss: 0.223181
+Epoch 6 Validation | AUC: 0.863165, LogLoss: 0.225804
 Test AUC: 0.820517
 ```
 
 ### time context v2
 
 ```text
-Epoch 1 Validation | AUC: 0.8600489814930248, LogLoss: 0.22617894411087036
-Epoch 2 Validation | AUC: 0.8633769745178127, LogLoss: 0.22347073256969452
-Epoch 3 Validation | AUC: 0.8643674719163711, LogLoss: 0.22294147312641144
-Epoch 4 Validation | AUC: 0.8642673092214735, LogLoss: 0.222646564245224
-Epoch 5 Validation | AUC: 0.8643459867948121, LogLoss: 0.22289179265499115
+Epoch 1 Validation | AUC: 0.860049, LogLoss: 0.226179
+Epoch 2 Validation | AUC: 0.863377, LogLoss: 0.223471
+Epoch 3 Validation | AUC: 0.864367, LogLoss: 0.222941
+Epoch 4 Validation | AUC: 0.864267, LogLoss: 0.222647
+Epoch 5 Validation | AUC: 0.864346, LogLoss: 0.222892
 Test AUC: 0.820265
 ```
 
 ### time context v2 + target_cate_hist
 
 ```text
-Epoch 1 Validation | AUC: 0.8596292039203078, LogLoss: 0.22613340616226196
-Epoch 2 Validation | AUC: 0.8633862057822165, LogLoss: 0.22339412569999695
-Epoch 3 Validation | AUC: 0.8637124220243307, LogLoss: 0.2233836054801941
-Epoch 4 Validation | AUC: 0.8630159748323187, LogLoss: 0.22374896705150604
-Epoch 5 Validation | AUC: 0.8639202791829825, LogLoss: 0.22301825881004333
-Epoch 6 Validation | AUC: 0.8635534825284971, LogLoss: 0.22504082322120667
-Test AUC: 未测试，怀疑v2不如v1
+Epoch 1 Validation | AUC: 0.859629, LogLoss: 0.226133
+Epoch 2 Validation | AUC: 0.863386, LogLoss: 0.223394
+Epoch 3 Validation | AUC: 0.863712, LogLoss: 0.223384
+Epoch 4 Validation | AUC: 0.863016, LogLoss: 0.223749
+Epoch 5 Validation | AUC: 0.863920, LogLoss: 0.223018
+Epoch 6 Validation | AUC: 0.863553, LogLoss: 0.225041
+Test AUC: 未测试，因为v2不如v1
 ```
 
-### main_base (time context v2 + target_cate_hist)
+</details>
+
+<details>
+<summary>Main epoch 记录</summary>
+
+### main_base (time context v1 + target_cate_hist)
+
 
 ```text
-Epoch 1 Validation | AUC: 0.8585210768798079, LogLoss: 0.22774861752986908
-Epoch 2 Validation | AUC: 0.8624159969604134, LogLoss: 0.22399556636810303
-Epoch 3 Validation | AUC: 0.8636553398306517, LogLoss: 0.2231462150812149
-Epoch 4 Validation | AUC: 0.8638524590452423, LogLoss: 0.22316649556159973
-Epoch 5 Validation | AUC: 0.8640690200761034, LogLoss: 0.22374610602855682
-Epoch 6 Validation | AUC: 0.8636659023394101, LogLoss: 0.2229994684457779
+Epoch 1 Validation | AUC: 0.858521, LogLoss: 0.227749
+Epoch 2 Validation | AUC: 0.862416, LogLoss: 0.223996
+Epoch 3 Validation | AUC: 0.863655, LogLoss: 0.223146
+Epoch 4 Validation | AUC: 0.863852, LogLoss: 0.223166
+Epoch 5 Validation | AUC: 0.864069, LogLoss: 0.223746
+Epoch 6 Validation | AUC: 0.863666, LogLoss: 0.222999
+Test AUC：0.8222
+```
+
+### main_hybrid_ns_self
+
+```text
+Epoch 1 Validation | AUC: 0.859000, LogLoss: 0.227512
+Epoch 2 Validation | AUC: 0.862230, LogLoss: 0.227064
+Epoch 3 Validation | AUC: 0.863340, LogLoss: 0.224158
+Epoch 4 Validation | AUC: 0.863180, LogLoss: 0.223397
+Epoch 5 Validation | AUC: 0.864470, LogLoss: 0.222976
+Epoch 6 Validation | AUC: 0.864040, LogLoss: 0.223229
 Test AUC：
 ```
 
 ### main_hybrid_ns_learnQ
 
 ```text
-Epoch 1 Validation | AUC: 0.8594209823124672, LogLoss: 0.2269304096698761
-Epoch 2 Validation | AUC: 0.8614140131662554, LogLoss: 0.22431623935699463
-Epoch 3 Validation | AUC: 0.86262498765924, LogLoss: 0.2241542786359787
-Epoch 4 Validation | AUC: 0.8636698162304017, LogLoss: 0.22304145991802216
-Epoch 5 Validation | AUC: 0.864176936142345, LogLoss: 0.2228860706090927
-Epoch 6 Validation | AUC: 0.8648499564753162, LogLoss: 0.22247886657714844
-Test AUC：
-```
-
-### main_hybrid_ns_self
-
-```text
-Epoch 1 Validation | AUC: 0.8590003183298006, LogLoss: 0.2275124192237854
-Epoch 2 Validation | AUC: 0.8622379947623687, LogLoss: 0.22706498205661774
-Epoch 3 Validation | AUC: 0.8633480901543749, LogLoss: 0.22415849566459656
-Epoch 4 Validation | AUC: 0.8631819692171463, LogLoss: 0.22339706122875214
-Epoch 5 Validation | AUC: 0.8644722725123479, LogLoss: 0.22297626733779907
-Epoch 6 Validation | AUC: 0.8640402758436504, LogLoss: 0.22322919964790344
+Epoch 1 Validation | AUC: 0.859421, LogLoss: 0.226930
+Epoch 2 Validation | AUC: 0.861414, LogLoss: 0.224316
+Epoch 3 Validation | AUC: 0.862625, LogLoss: 0.224154
+Epoch 4 Validation | AUC: 0.863670, LogLoss: 0.223041
+Epoch 5 Validation | AUC: 0.864177, LogLoss: 0.222886
+Epoch 6 Validation | AUC: 0.864850, LogLoss: 0.222479
 Test AUC：
 ```
 
@@ -233,11 +239,21 @@ Test AUC：
 Test AUC：
 ```
 
-### main_v2_currentActive
+### main_v2_Act
 
 ```text
-Epoch 1 Validation | AUC: 0.8612138892826436, LogLoss: 0.22549350559711456
-Epoch 2 Validation | AUC: 0.8633294657688486, LogLoss: 0.2236885130405426
+Epoch 1 Validation | AUC: 0.861214, LogLoss: 0.225494
+Epoch 2 Validation | AUC: 0.863329, LogLoss: 0.223689
+Epoch 3 Validation | AUC: 0.863973, LogLoss: 0.222719
+Epoch 4 Validation | AUC: 0.864003, LogLoss: 0.223151
+Epoch 5 Validation | AUC: 0.863648, LogLoss: 0.223132
+Test AUC：
+```
+
+### main_v2_Act_TarDomaiLevelTimeWise
+
+```text
+
 Test AUC：
 ```
 
