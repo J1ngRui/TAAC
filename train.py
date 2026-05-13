@@ -102,6 +102,7 @@ def build_recent_activity_config(args: argparse.Namespace) -> Dict[str, object]:
         "enabled": True,
         "feature_fids": feature_fids,
         "windows_seconds": windows_seconds,
+        "mode": args.recent_activity_mode,
     }
 
 
@@ -236,6 +237,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--recent_activity_windows_seconds', type=str,
                         default='3600,86400,604800',
                         help='Comma-separated recent-count windows in seconds')
+    parser.add_argument('--recent_activity_mode', type=str, default='per_domain',
+                        choices=['per_domain', 'global'],
+                        help='Recent-activity feature granularity: per_domain keeps one '
+                             'feature group per sequence domain; global aggregates all '
+                             'sequence domains into one user-state group')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '

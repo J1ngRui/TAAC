@@ -68,8 +68,6 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 |   11 | Recent Activity   | 用户近期活跃度可能是强泛化信号。                  | 每路序列生成 last_delta / 1h / 1d / 7d count bucket，追加到最后一个 user NS group | clean A/B 已单独对照 | 低容量统计特征，不新增 token | 保留为低风险增益特征，继续用 test A/B 判断。 |
 |   12 | Global Target Timewise | target/history 需要表达近期趋势，但避免 per-domain 稀疏。 | target_cate_hist 后追加全局 last_position / recent_ratio / recent_trend bucket | clean A/B 已单独对照 | 比 per-domain timewise 更低风险 | 当前主线候选，优先保留 global 版本。 |
 
-
-
 ## A / B 实验对照
 
 > 对照口径：`best valid` 按验证集 AUC 最高 epoch 统计。`相对 Best Test` = Test AUC - 当前 clean main_base Test AUC，当前 best = 0.822200。

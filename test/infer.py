@@ -153,6 +153,7 @@ def build_recent_activity_config(train_config: Dict[str, Any]) -> Dict[str, Any]
         'enabled': True,
         'feature_fids': feature_fids,
         'windows_seconds': windows_seconds,
+        'mode': train_config.get('recent_activity_mode', 'per_domain'),
     }
 
 

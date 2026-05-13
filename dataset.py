@@ -200,6 +200,9 @@ class PCVRParquetDataset(IterableDataset):
         self.use_recent_activity = bool(
             self.recent_activity_config.get('enabled', False)
         )
+        self.recent_activity_mode = str(
+            self.recent_activity_config.get('mode', 'per_domain')
+        )
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -428,12 +431,27 @@ class PCVRParquetDataset(IterableDataset):
         windows_seconds = list(
             self.recent_activity_config.get('windows_seconds', [3600, 86400, 7 * 86400])
         )
-        expected = len(self.seq_domains) * (1 + len(windows_seconds))
+        self.recent_activity_mode = str(
+            self.recent_activity_config.get('mode', 'per_domain')
+        )
+        if self.recent_activity_mode not in ('per_domain', 'global'):
+            raise ValueError(
+                "recent_activity_config['mode'] must be 'per_domain' or 'global'"
+            )
+        features_per_group = 1 + len(windows_seconds)
+        expected = features_per_group
+        if self.recent_activity_mode == 'per_domain':
+            expected *= len(self.seq_domains)
         if len(feature_fids) != expected:
             raise ValueError(
                 "recent_activity_config['feature_fids'] must contain "
-                f"{expected} fids: one last_delta bucket plus {len(windows_seconds)} "
-                f"recent-count buckets for each of {len(self.seq_domains)} domains"
+                f"{expected} fids for mode={self.recent_activity_mode}: "
+                f"one last_delta bucket plus {len(windows_seconds)} recent-count buckets"
+                + (
+                    f" for each of {len(self.seq_domains)} domains"
+                    if self.recent_activity_mode == 'per_domain'
+                    else ""
+                )
             )
 
         existing = set(self.user_int_schema.feature_ids)
@@ -448,11 +466,14 @@ class PCVRParquetDataset(IterableDataset):
             self.user_int_vocab_sizes.append(5)
         self.recent_activity_feature_ids = [int(fid) for fid in feature_fids]
         self.recent_activity_windows_seconds = [int(w) for w in windows_seconds]
-        self._recent_activity_features_per_domain = 1 + len(self.recent_activity_windows_seconds)
-        self._recent_activity_domain_offset = {
-            domain: self._recent_activity_offset + i * self._recent_activity_features_per_domain
-            for i, domain in enumerate(self.seq_domains)
-        }
+        self._recent_activity_features_per_group = features_per_group
+        self._recent_activity_features_per_domain = features_per_group
+        self._recent_activity_domain_offset = {}
+        if self.recent_activity_mode == 'per_domain':
+            self._recent_activity_domain_offset = {
+                domain: self._recent_activity_offset + i * self._recent_activity_features_per_group
+                for i, domain in enumerate(self.seq_domains)
+            }
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -877,7 +898,51 @@ class PCVRParquetDataset(IterableDataset):
             feats.append(self._bucket_target_cate_count(count))
 
         start = self._recent_activity_domain_offset[domain]
-        end = start + self._recent_activity_features_per_domain
+        end = start + self._recent_activity_features_per_group
+        user_int[:, start:end] = np.stack(feats, axis=1)
+
+    def _write_global_recent_activity_features(
+        self,
+        *,
+        user_int: "npt.NDArray[np.int64]",
+        seq_timestamps_list: List["npt.NDArray[np.int64]"],
+        seq_lengths_list: List["npt.NDArray[np.int64]"],
+        current_timestamps: "npt.NDArray[np.int64]",
+    ) -> None:
+        """Write global recent-activity buckets over all sequence domains."""
+        if not self.use_recent_activity or not seq_timestamps_list:
+            return
+
+        valid_parts = []
+        delta_parts = []
+        B = current_timestamps.shape[0]
+        current_ts = current_timestamps.reshape(B, 1)
+        for seq_timestamps, seq_lengths in zip(seq_timestamps_list, seq_lengths_list):
+            _, L = seq_timestamps.shape
+            positions = np.arange(L).reshape(1, L)
+            valid = (
+                (positions < seq_lengths.reshape(B, 1))
+                & (seq_timestamps > 0)
+                & (seq_timestamps < current_ts)
+            )
+            delta = current_ts - seq_timestamps
+            valid_parts.append(valid)
+            delta_parts.append(delta)
+
+        valid_all = np.concatenate(valid_parts, axis=1)
+        delta_all = np.concatenate(delta_parts, axis=1)
+
+        masked_delta = np.where(valid_all, delta_all, np.iinfo(np.int64).max)
+        last_delta = masked_delta.min(axis=1)
+        last_delta = np.where(last_delta == np.iinfo(np.int64).max, -1, last_delta)
+
+        feats = [self._bucket_target_last_delta(last_delta)]
+        for window in self.recent_activity_windows_seconds:
+            count = (valid_all & (delta_all <= int(window))).sum(axis=1).astype(np.int64)
+            feats.append(self._bucket_target_cate_count(count))
+
+        start = self._recent_activity_offset
+        end = start + self._recent_activity_features_per_group
         user_int[:, start:end] = np.stack(feats, axis=1)
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
@@ -980,6 +1045,8 @@ class PCVRParquetDataset(IterableDataset):
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
+        recent_activity_ts_list: List["npt.NDArray[np.int64]"] = []
+        recent_activity_len_list: List["npt.NDArray[np.int64]"] = []
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
@@ -1069,7 +1136,10 @@ class PCVRParquetDataset(IterableDataset):
             else:
                 result[f'{domain}_timestamp'] = torch.from_numpy(ts_padded.copy())
 
-            if self.use_recent_activity:
+            if (
+                self.use_recent_activity
+                and self.recent_activity_mode == 'per_domain'
+            ):
                 self._write_recent_activity_features(
                     domain=domain,
                     user_int=user_int,
@@ -1077,6 +1147,13 @@ class PCVRParquetDataset(IterableDataset):
                     current_timestamps=timestamps,
                     seq_lengths=lengths,
                 )
+            elif (
+                self.use_recent_activity
+                and self.recent_activity_mode == 'global'
+                and ts_padded is not None
+            ):
+                recent_activity_ts_list.append(ts_padded)
+                recent_activity_len_list.append(lengths.copy())
 
             if self.use_target_hist_match and target_match_accum is not None:
                 self._accumulate_target_hist_match(
@@ -1088,6 +1165,17 @@ class PCVRParquetDataset(IterableDataset):
                     seq_lengths=lengths,
                     accum=target_match_accum,
                 )
+
+        if (
+            self.use_recent_activity
+            and self.recent_activity_mode == 'global'
+        ):
+            self._write_global_recent_activity_features(
+                user_int=user_int,
+                seq_timestamps_list=recent_activity_ts_list,
+                seq_lengths_list=recent_activity_len_list,
+                current_timestamps=timestamps,
+            )
 
         if self.use_target_hist_match and target_match_accum is not None:
             self._write_target_hist_match_features(item_int, target_match_accum)
