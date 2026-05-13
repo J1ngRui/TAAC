@@ -106,6 +106,12 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+# Discrete feature ids reserve separate slots for structural padding, missing,
+# and real raw values. This keeps meaningful raw 0 buckets distinct from null/-1.
+DISCRETE_PADDING_ID = 0
+DISCRETE_MISSING_ID = 1
+DISCRETE_VALUE_OFFSET = 2
+
 # Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
 BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
@@ -135,7 +141,8 @@ NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
 
-    - int features: scalar or list (multi-hot); values <= 0 are mapped to 0 (padding).
+    - int features: scalar or list (multi-hot); 0 is structural padding,
+      1 is missing, and raw values are shifted by +2.
     - dense features: ``list<float>``, variable-length padded up to ``max_dim``.
     - sequence features: ``list<int64>``, grouped by domain; includes side-info
       columns and an optional timestamp column (used for time-bucketing).
@@ -387,6 +394,10 @@ class PCVRParquetDataset(IterableDataset):
                 f"target_hist_match feature fids already exist in item_int schema: {dup}"
             )
 
+        self.target_hist_match_recent_k = int(
+            self.target_hist_match_config.get('recent_k', 64)
+        )
+
         # Max bucket ids for:
         # cate_in_hist, cate_count_bucket, cate_ratio_bucket,
         # cate_last_time_delta_bucket, then optional:
@@ -395,15 +406,13 @@ class PCVRParquetDataset(IterableDataset):
         vocab_sizes = [1, 5, 4, 5]
         if len(feature_fids) == timewise_count:
             vocab_sizes += [7, 5, 5]
+        self._target_hist_match_vocab_sizes = vocab_sizes
         for fid, vs in zip(feature_fids, vocab_sizes):
             self.item_int_schema.add(int(fid), 1)
             self.item_int_vocab_sizes.append(vs)
         self.target_hist_match_feature_ids = [int(fid) for fid in feature_fids]
         self._target_hist_match_feature_count = len(feature_fids)
         self._target_hist_match_has_timewise = len(feature_fids) == timewise_count
-        self.target_hist_match_recent_k = int(
-            self.target_hist_match_config.get('recent_k', 64)
-        )
 
         target_cate_fid = int(self.target_hist_match_config['target_cate_item_fid'])
         self._target_cate_offset, self._target_cate_dim = (
@@ -464,6 +473,7 @@ class PCVRParquetDataset(IterableDataset):
             self.user_int_schema.add(int(fid), 1)
             self.user_int_vocab_sizes.append(5)
         self.recent_activity_feature_ids = [int(fid) for fid in feature_fids]
+        self._recent_activity_vocab_sizes = [5] * len(feature_fids)
         self.recent_activity_windows_seconds = [int(w) for w in windows_seconds]
         self._recent_activity_features_per_group = features_per_group
         self._recent_activity_features_per_domain = features_per_group
@@ -536,11 +546,13 @@ class PCVRParquetDataset(IterableDataset):
         col_idx: int,
         arr: "npt.NDArray[np.int64]",
         vocab_size: int,
+        valid_mask: Optional["npt.NDArray[np.bool_]"] = None,
+        clip_value: int = DISCRETE_PADDING_ID,
     ) -> None:
-        """Record out-of-bound indices and (optionally) clip them to 0,
-        without printing to the console.
-        """
-        oob_mask = arr >= vocab_size
+        """Record out-of-bound indices and optionally clip them in-place."""
+        oob_mask = arr > vocab_size
+        if valid_mask is not None:
+            oob_mask &= valid_mask
         if not oob_mask.any():
             return
         key = (group, col_idx)
@@ -558,12 +570,66 @@ class PCVRParquetDataset(IterableDataset):
                 'count': n, 'max': mx, 'min_oob': mn, 'vocab': vocab_size,
             }
         if self.clip_vocab:
-            arr[oob_mask] = 0
+            arr[oob_mask] = clip_value
         else:
             raise ValueError(
                 f"{group} col_idx={col_idx}: {n} values out of range "
-                f"[0, {vocab_size}), actual=[{mn}, {mx}]. "
+                f"[0, {vocab_size}], actual=[{mn}, {mx}]. "
                 f"Use clip_vocab=True to clip or fix schema.json")
+
+    def _encode_discrete_values(
+        self,
+        arr: "npt.NDArray[np.int64]",
+        vocab_size: int,
+        group: str,
+        col_idx: int,
+        padding_mask: Optional["npt.NDArray[np.bool_]"] = None,
+    ) -> "npt.NDArray[np.int64]":
+        """Encode raw discrete ids while preserving missing vs raw zero.
+
+        Encoded ids:
+          0 = structural padding
+          1 = null / negative raw value / clipped OOB
+          raw value k >= 0 -> k + 2
+        """
+        encoded = np.zeros(arr.shape, dtype=np.int64)
+        if vocab_size <= 0:
+            return encoded
+
+        if padding_mask is None:
+            non_padding = np.ones(arr.shape, dtype=bool)
+        else:
+            non_padding = ~padding_mask
+
+        valid_raw = non_padding & (arr >= 0)
+        self._record_oob(
+            group, col_idx, arr, vocab_size,
+            valid_mask=valid_raw, clip_value=-1,
+        )
+
+        missing = non_padding & (arr < 0)
+        values = non_padding & (arr >= 0)
+        encoded[missing] = DISCRETE_MISSING_ID
+        encoded[values] = arr[values] + DISCRETE_VALUE_OFFSET
+        return encoded
+
+    def _encode_discrete_feature_parts(
+        self,
+        feat_parts: List["npt.NDArray[np.int64]"],
+        vocab_sizes: List[int],
+        feature_ids: List[int],
+        group: str,
+    ) -> List["npt.NDArray[np.int64]"]:
+        """Encode a list of derived scalar discrete feature columns."""
+        return [
+            self._encode_discrete_values(
+                np.asarray(part, dtype=np.int64).copy(),
+                int(vs),
+                group,
+                int(fid),
+            )
+            for part, vs, fid in zip(feat_parts, vocab_sizes, feature_ids)
+        ]
 
     def dump_oob_stats(self, path: Optional[str] = None) -> None:
         """Dump out-of-bound statistics to a file if ``path`` is provided,
@@ -595,15 +661,15 @@ class PCVRParquetDataset(IterableDataset):
     ) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
         """Pad an Arrow ``ListArray`` of ints to shape ``[B, max_len]``.
 
-        Values <= 0 are mapped to 0 (padding). Note: the raw data contains -1
-        (missing); currently treated the same way as 0 (padding).
+        Values are copied as raw ids. Structural padding is represented by the
+        returned lengths; callers encode negative values as missing separately.
 
         Returns:
             A tuple ``(padded, lengths)`` where ``padded`` has shape
             ``[B, max_len]`` and ``lengths`` has shape ``[B]``.
         """
         offsets = arrow_col.offsets.to_numpy()
-        values = arrow_col.values.to_numpy()
+        values = arrow_col.values.fill_null(-1).to_numpy(zero_copy_only=False)
 
         padded = np.zeros((B, max_len), dtype=np.int64)
         lengths = np.zeros(B, dtype=np.int64)
@@ -617,7 +683,6 @@ class PCVRParquetDataset(IterableDataset):
             padded[i, :use_len] = values[start:start + use_len]
             lengths[i] = use_len
 
-        padded[padded <= 0] = 0
         return padded, lengths
 
     # Backwards-compatible alias kept for bench_raw_dataset.py and other
@@ -761,10 +826,10 @@ class PCVRParquetDataset(IterableDataset):
             return
 
         hist_cate = seq_values[:, cate_slot, :]
-        cate_valid = base_valid & (hist_cate > 0)
+        cate_valid = base_valid & (hist_cate > DISCRETE_MISSING_ID)
         accum['hist_cate_len'] += cate_valid.sum(axis=1).astype(np.int64)
 
-        target_cate_valid = target_cate_values > 0
+        target_cate_valid = target_cate_values > DISCRETE_MISSING_ID
         if target_cate_values.shape[1] == 1:
             target_cate = target_cate_values[:, 0].reshape(B, 1)
             cate_match = (
@@ -861,6 +926,12 @@ class PCVRParquetDataset(IterableDataset):
         if self._target_hist_match_has_timewise:
             feat_parts.extend(self._build_target_timewise_features(accum))
 
+        feat_parts = self._encode_discrete_feature_parts(
+            feat_parts,
+            self._target_hist_match_vocab_sizes,
+            self.target_hist_match_feature_ids,
+            'target_hist_match',
+        )
         feats = np.stack(feat_parts, axis=1)
         end = self._target_hist_match_offset + self._target_hist_match_feature_count
         item_int[:, self._target_hist_match_offset:end] = feats
@@ -898,6 +969,15 @@ class PCVRParquetDataset(IterableDataset):
 
         start = self._recent_activity_domain_offset[domain]
         end = start + self._recent_activity_features_per_group
+        domain_index = self.seq_domains.index(domain)
+        fid_start = domain_index * self._recent_activity_features_per_group
+        fid_end = fid_start + self._recent_activity_features_per_group
+        feats = self._encode_discrete_feature_parts(
+            feats,
+            self._recent_activity_vocab_sizes[fid_start:fid_end],
+            self.recent_activity_feature_ids[fid_start:fid_end],
+            'recent_activity',
+        )
         user_int[:, start:end] = np.stack(feats, axis=1)
 
     def _write_global_recent_activity_features(
@@ -942,6 +1022,12 @@ class PCVRParquetDataset(IterableDataset):
 
         start = self._recent_activity_offset
         end = start + self._recent_activity_features_per_group
+        feats = self._encode_discrete_feature_parts(
+            feats,
+            self._recent_activity_vocab_sizes,
+            self.recent_activity_feature_ids,
+            'recent_activity',
+        )
         user_int[:, start:end] = np.stack(feats, axis=1)
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
@@ -957,29 +1043,23 @@ class PCVRParquetDataset(IterableDataset):
             labels = np.zeros(B, dtype=np.int64)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
         # ---- user_int: write into pre-allocated buffer ----
-        # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
-        # are treated the same as padding. Features with vs==0 have no vocab
-        # information and are forced to 0 on the dataset side so that the
-        # model's 1-slot Embedding (created for vs=0) is never indexed out of
-        # range.
+        # Note: 0 is structural padding, 1 is missing/null/-1/OOB, and raw
+        # values (including raw 0 buckets) are shifted by +2. Features with
+        # vs==0 have no vocab information and are forced to padding.
         user_int = self._buf_user_int[:B]
         user_int[:] = 0
         for ci, dim, offset, vs in self._user_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
-                arr[arr <= 0] = 0
-                if vs > 0:
-                    self._record_oob('user_int', ci, arr, vs)
-                else:
-                    arr[:] = 0
+                arr = col.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
+                arr = self._encode_discrete_values(arr, vs, 'user_int', ci)
                 user_int[:, offset] = arr
             else:
-                padded, _ = self._pad_varlen_int_column(col, dim, B)
-                if vs > 0:
-                    self._record_oob('user_int', ci, padded, vs)
-                else:
-                    padded[:] = 0
+                padded, lengths = self._pad_varlen_int_column(col, dim, B)
+                padding_mask = np.arange(dim).reshape(1, dim) >= lengths.reshape(B, 1)
+                padded = self._encode_discrete_values(
+                    padded, vs, 'user_int', ci, padding_mask=padding_mask,
+                )
                 user_int[:, offset:offset + dim] = padded
 
         # ---- item_int ----
@@ -988,19 +1068,15 @@ class PCVRParquetDataset(IterableDataset):
         for ci, dim, offset, vs in self._item_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
-                arr[arr <= 0] = 0
-                if vs > 0:
-                    self._record_oob('item_int', ci, arr, vs)
-                else:
-                    arr[:] = 0
+                arr = col.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
+                arr = self._encode_discrete_values(arr, vs, 'item_int', ci)
                 item_int[:, offset] = arr
             else:
-                padded, _ = self._pad_varlen_int_column(col, dim, B)
-                if vs > 0:
-                    self._record_oob('item_int', ci, padded, vs)
-                else:
-                    padded[:] = 0
+                padded, lengths = self._pad_varlen_int_column(col, dim, B)
+                padding_mask = np.arange(dim).reshape(1, dim) >= lengths.reshape(B, 1)
+                padded = self._encode_discrete_values(
+                    padded, vs, 'item_int', ci, padding_mask=padding_mask,
+                )
                 item_int[:, offset:offset + dim] = padded
 
         target_match_accum = None
@@ -1061,8 +1137,14 @@ class PCVRParquetDataset(IterableDataset):
             col_data = []
             for ci, slot, vs in side_plan:
                 col = batch.column(ci)
-                col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
+                col_data.append((
+                    col.offsets.to_numpy(),
+                    col.values.fill_null(-1).to_numpy(zero_copy_only=False),
+                    vs,
+                    ci,
+                ))
 
+            slot_lengths = np.zeros((len(col_data), B), dtype=np.int64)
             for c, (offs, vals, vs, ci) in enumerate(col_data):
                 for i in range(B):
                     s = int(offs[i])
@@ -1072,21 +1154,19 @@ class PCVRParquetDataset(IterableDataset):
                         continue
                     ul = min(rl, max_len)
                     out[i, c, :ul] = vals[s:s + ul]
+                    slot_lengths[c, i] = ul
                     if ul > lengths[i]:
                         lengths[i] = ul
 
-            # Values <= 0 -> 0.
-            out[out <= 0] = 0
-
-            # Check out-of-bound values per feature's vocab_size.
-            # vs==0 means no vocab info; force the whole slice to 0 so that
-            # the model's 1-slot Embedding is never indexed out of range.
+            # Encode each side-info feature. vs==0 means no vocab info; force
+            # that slice to padding so the model is never indexed out of range.
+            positions = np.arange(max_len).reshape(1, max_len)
             for c, (_, _, vs, ci) in enumerate(col_data):
                 slice_c = out[:, c, :]
-                if vs > 0:
-                    self._record_oob(f'seq_{domain}', ci, slice_c, vs)
-                else:
-                    slice_c[:] = 0
+                padding_mask = positions >= slot_lengths[c].reshape(B, 1)
+                slice_c[:] = self._encode_discrete_values(
+                    slice_c, vs, f'seq_{domain}', ci, padding_mask=padding_mask,
+                )
 
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())

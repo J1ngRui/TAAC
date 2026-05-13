@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, NamedTuple, Tuple, Optional
 
+DISCRETE_VALUE_OFFSET = 2
+
 
 class ModelInput(NamedTuple):
     user_int_feats: torch.Tensor
@@ -1012,7 +1014,11 @@ class GroupNSTokenizer(nn.Module):
             if skip:
                 embs.append(None)
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                embs.append(nn.Embedding(
+                    int(vs) + DISCRETE_VALUE_OFFSET + 1,
+                    emb_dim,
+                    padding_idx=0,
+                ))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         
         # Map from fid index to position in self.embs (or -1 if filtered)
@@ -1112,7 +1118,11 @@ class RankMixerNSTokenizer(nn.Module):
             if skip:
                 embs.append(None)
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                embs.append(nn.Embedding(
+                    int(vs) + DISCRETE_VALUE_OFFSET + 1,
+                    emb_dim,
+                    padding_idx=0,
+                ))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
@@ -1529,7 +1539,11 @@ class PCVRHyFormer(nn.Module):
                 if skip:
                     embs_raw.append(None)
                 else:
-                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                    embs_raw.append(nn.Embedding(
+                        int(vs) + DISCRETE_VALUE_OFFSET + 1,
+                        emb_dim,
+                        padding_idx=0,
+                    ))
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
             # Map from position index to real index in module_list (-1 if skipped)
             index_map = []
