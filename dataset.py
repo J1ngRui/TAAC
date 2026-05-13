@@ -369,12 +369,12 @@ class PCVRParquetDataset(IterableDataset):
             )
 
         feature_fids = list(self.target_hist_match_config['feature_fids'])
-        extended_count = 4 + 3 * len(self.seq_domains)
-        if len(feature_fids) not in (4, extended_count):
+        timewise_count = 7
+        if len(feature_fids) not in (4, timewise_count):
             raise ValueError(
                 "target_hist_match_config['feature_fids'] must contain either "
-                f"4 fids for target_cate_match_v1 or {extended_count} fids "
-                "for target_state_v2 domain-temporal features"
+                f"4 fids for target_cate_match_v1 or {timewise_count} fids "
+                "for target_cate_state timewise features"
             )
 
         existing = set(self.item_int_schema.feature_ids)
@@ -390,19 +390,18 @@ class PCVRParquetDataset(IterableDataset):
 
         # Max bucket ids for:
         # cate_in_hist, cate_count_bucket, cate_ratio_bucket,
-        # cate_last_delta_bucket, then per-domain
-        # recent_rate_bucket, trend_bucket, last_delta_bucket.
+        # cate_last_time_delta_bucket, then optional:
+        # cate_last_position_delta_bucket, cate_recent_ratio_bucket,
+        # cate_recent_trend_bucket.
         vocab_sizes = [1, 5, 4, 5]
-        if len(feature_fids) == extended_count:
-            vocab_sizes += [5, 5, 7] * len(self.seq_domains)
+        if len(feature_fids) == timewise_count:
+            vocab_sizes += [7, 5, 5]
         for fid, vs in zip(feature_fids, vocab_sizes):
             self.item_int_schema.add(int(fid), 1)
             self.item_int_vocab_sizes.append(vs)
         self.target_hist_match_feature_ids = [int(fid) for fid in feature_fids]
         self._target_hist_match_feature_count = len(feature_fids)
-        self._target_hist_match_has_domain_temporal = (
-            len(feature_fids) == extended_count
-        )
+        self._target_hist_match_has_timewise = len(feature_fids) == timewise_count
 
         target_cate_fid = int(self.target_hist_match_config['target_cate_item_fid'])
         self._target_cate_offset, self._target_cate_dim = (
@@ -701,6 +700,24 @@ class PCVRParquetDataset(IterableDataset):
         bucket[valid & (delta > 160)] = 7
         return bucket
 
+    def _append_target_timewise_stats(
+        self,
+        accum: Dict[str, Any],
+        cate_valid: "npt.NDArray[np.bool_]",
+        cate_match: "npt.NDArray[np.bool_]",
+        seq_timestamps: Optional["npt.NDArray[np.int64]"],
+    ) -> None:
+        """Append per-domain valid/match timestamps for one-pass finalization."""
+        if not self._target_hist_match_has_timewise or seq_timestamps is None:
+            return
+
+        start = int(accum['timewise_offset'])
+        end = start + seq_timestamps.shape[1]
+        valid_ts = np.where(cate_valid, seq_timestamps, 0)
+        accum['timewise_valid_ts'][:, start:end] = valid_ts
+        accum['timewise_match'][:, start:end] = cate_match & cate_valid
+        accum['timewise_offset'] = end
+
     def _accumulate_target_hist_match(
         self,
         *,
@@ -710,7 +727,7 @@ class PCVRParquetDataset(IterableDataset):
         current_timestamps: "npt.NDArray[np.int64]",
         target_cate_values: "npt.NDArray[np.int64]",
         seq_lengths: "npt.NDArray[np.int64]",
-        accum: Dict[str, "npt.NDArray[np.int64]"],
+        accum: Dict[str, Any],
     ) -> None:
         """Accumulate v1 target-history matching stats from one sequence domain."""
         B, _, L = seq_values.shape
@@ -750,47 +767,62 @@ class PCVRParquetDataset(IterableDataset):
                 accum['cate_last_delta'],
                 masked_delta.min(axis=1),
             )
+        self._append_target_timewise_stats(accum, cate_valid, cate_match, seq_timestamps)
 
-        domain_temporal = accum.get('domain_temporal')
-        if domain_temporal is not None and domain in domain_temporal:
-            hist_len = cate_valid.sum(axis=1).astype(np.int64)
-            long_count = cate_match.sum(axis=1).astype(np.int64)
+    def _build_target_timewise_features(
+        self,
+        accum: Dict[str, Any],
+    ) -> List["npt.NDArray[np.int64]"]:
+        """Build global target-cate timewise buckets from accumulated buffers."""
+        valid_ts = accum['timewise_valid_ts']
+        match = accum['timewise_match']
+        B, total_len = valid_ts.shape
+        has_valid = valid_ts > 0
+        has_match = match & has_valid
 
-            ranks_from_end = np.flip(
-                np.cumsum(np.flip(cate_valid, axis=1), axis=1),
-                axis=1,
-            )
-            recent_valid = cate_valid & (ranks_from_end <= self.target_hist_match_recent_k)
+        latest_match_ts = np.where(has_match, valid_ts, 0).max(axis=1)
+        position_delta = np.full(B, -1, dtype=np.int64)
+        matched = latest_match_ts > 0
+        if matched.any():
+            position_delta[matched] = (
+                valid_ts[matched] > latest_match_ts[matched, None]
+            ).sum(axis=1).astype(np.int64)
+
+        recent_k = min(int(self.target_hist_match_recent_k), total_len)
+        if recent_k <= 0:
+            recent_len = np.zeros(B, dtype=np.int64)
+            recent_count = np.zeros(B, dtype=np.int64)
+        else:
+            order = np.argpartition(-valid_ts, recent_k - 1, axis=1)[:, :recent_k]
+            recent_ts = np.take_along_axis(valid_ts, order, axis=1)
+            recent_match = np.take_along_axis(match, order, axis=1)
+            recent_valid = recent_ts > 0
             recent_len = recent_valid.sum(axis=1).astype(np.int64)
-            recent_count = (cate_match & recent_valid).sum(axis=1).astype(np.int64)
+            recent_count = (recent_match & recent_valid).sum(axis=1).astype(np.int64)
 
-            recent_rate = np.zeros(B, dtype=np.float32)
-            long_rate = np.zeros(B, dtype=np.float32)
-            recent_nonzero = recent_len > 0
-            long_nonzero = hist_len > 0
-            recent_rate[recent_nonzero] = (
-                recent_count[recent_nonzero] / recent_len[recent_nonzero].astype(np.float32)
-            )
-            long_rate[long_nonzero] = (
-                long_count[long_nonzero] / hist_len[long_nonzero].astype(np.float32)
-            )
-            trend = recent_rate - long_rate
+        recent_rate = np.zeros(B, dtype=np.float32)
+        long_rate = np.zeros(B, dtype=np.float32)
+        recent_nonzero = recent_len > 0
+        long_nonzero = accum['hist_cate_len'] > 0
+        recent_rate[recent_nonzero] = (
+            recent_count[recent_nonzero] / recent_len[recent_nonzero].astype(np.float32)
+        )
+        long_rate[long_nonzero] = (
+            accum['cate_match_count'][long_nonzero]
+            / accum['hist_cate_len'][long_nonzero].astype(np.float32)
+        )
+        trend = recent_rate - long_rate
 
-            rank_from_start = np.cumsum(cate_valid, axis=1)
-            match_ranks = np.where(cate_match, rank_from_start, 0)
-            last_match_rank = match_ranks.max(axis=1).astype(np.int64)
-            position_delta = np.full(B, -1, dtype=np.int64)
-            has_match = last_match_rank > 0
-            position_delta[has_match] = hist_len[has_match] - last_match_rank[has_match]
-
-            domain_temporal[domain][:, 0] = self._bucket_target_recent_rate(recent_rate)
-            domain_temporal[domain][:, 1] = self._bucket_target_trend(trend, hist_len)
-            domain_temporal[domain][:, 2] = self._bucket_target_position_delta(position_delta)
+        return [
+            self._bucket_target_position_delta(position_delta),
+            self._bucket_target_recent_rate(recent_rate),
+            self._bucket_target_trend(trend, accum['hist_cate_len']),
+        ]
 
     def _write_target_hist_match_features(
         self,
         item_int: "npt.NDArray[np.int64]",
-        accum: Dict[str, "npt.NDArray[np.int64]"],
+        accum: Dict[str, Any],
     ) -> None:
         """Write v1 target-history matching buckets into appended item_int columns."""
         if not self.use_target_hist_match:
@@ -806,14 +838,8 @@ class PCVRParquetDataset(IterableDataset):
             self._bucket_target_cate_ratio(cate_count, accum['hist_cate_len']),
             self._bucket_target_last_delta(last_delta),
         ]
-        if self._target_hist_match_has_domain_temporal:
-            domain_temporal = accum.get('domain_temporal', {})
-            for domain in self.seq_domains:
-                feat_parts.extend([
-                    domain_temporal[domain][:, 0],
-                    domain_temporal[domain][:, 1],
-                    domain_temporal[domain][:, 2],
-                ])
+        if self._target_hist_match_has_timewise:
+            feat_parts.extend(self._build_target_timewise_features(accum))
 
         feats = np.stack(feat_parts, axis=1)
         end = self._target_hist_match_offset + self._target_hist_match_feature_count
@@ -924,11 +950,15 @@ class PCVRParquetDataset(IterableDataset):
                 'hist_cate_len': np.zeros(B, dtype=np.int64),
                 'cate_last_delta': np.full(B, np.iinfo(np.int64).max, dtype=np.int64),
             }
-            if self._target_hist_match_has_domain_temporal:
-                target_match_accum['domain_temporal'] = {
-                    domain: np.zeros((B, 3), dtype=np.int64)
-                    for domain in self.seq_domains
-                }
+            if self._target_hist_match_has_timewise:
+                timewise_width = sum(self._seq_maxlen[domain] for domain in self.seq_domains)
+                target_match_accum['timewise_valid_ts'] = np.zeros(
+                    (B, timewise_width), dtype=np.int64
+                )
+                target_match_accum['timewise_match'] = np.zeros(
+                    (B, timewise_width), dtype=bool
+                )
+                target_match_accum['timewise_offset'] = 0
 
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]

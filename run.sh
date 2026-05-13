@@ -4,8 +4,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
 # ---- Active config: group + time context v1 + target-cate history match + BCE ----
 python3 -u "${SCRIPT_DIR}/train.py" \
-    --ns_tokenizer_type hybrid \
-    --ns_hybrid_mode learnQ \
+    --ns_tokenizer_type group \
     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
     --num_queries 2 \
     --use_time_context \

@@ -74,10 +74,10 @@ def build_target_hist_match_config(args: argparse.Namespace) -> Dict[str, object
         )
 
     feature_fids = parse_int_list(args.target_hist_match_feature_fids)
-    if len(feature_fids) not in (4, 16):
+    if len(feature_fids) not in (4, 7):
         raise ValueError(
             "--target_hist_match_feature_fids must contain either 4 legacy fids "
-            "or 16 target-state fids"
+            "or 7 target-cate-state fids"
         )
 
     return {
@@ -207,17 +207,15 @@ def parse_args() -> argparse.Namespace:
                              '(required by --use_target_hist_match)')
     parser.add_argument('--target_hist_match_feature_fids', type=str,
                         default='200001,200002,200003,200004,'
-                                '200005,200006,200007,'
-                                '200008,200009,200010,'
-                                '200011,200012,200013,'
-                                '200014,200015,200016',
+                                '200005,200006,200007',
                         help='Synthetic item-int fids for target category matching '
                              'features: cate_in_hist,cate_count_bucket,'
-                             'cate_ratio_bucket,cate_last_delta_bucket, followed by '
-                             'per-domain recent_rate,trend,last_delta buckets')
+                             'cate_ratio_bucket,cate_last_time_delta_bucket,'
+                             'cate_last_position_delta_bucket,cate_recent_ratio_bucket,'
+                             'cate_recent_trend_bucket')
     parser.add_argument('--target_hist_match_recent_k', type=int, default=64,
-                        help='Number of most-recent valid positions per domain used '
-                             'for target-category recent_rate/trend features')
+                        help='Number of most-recent valid target-category history '
+                             'positions used for recent_ratio/trend features')
     parser.add_argument('--use_recent_activity', action='store_true', default=False,
                         help='Append per-domain recent-activity bucket features '
                              'as synthetic user-int features')

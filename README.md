@@ -235,7 +235,12 @@ Test AUC：
 ### main_v2 (domain-only emb)
 
 ```text
-
+Epoch 1 Validation | AUC: 0.8599513096535375, LogLoss: 0.22652412950992584
+Epoch 2 Validation | AUC: 0.8627960718404153, LogLoss: 0.22386665642261505
+Epoch 3 Validation | AUC: 0.8631914155663172, LogLoss: 0.2236473262310028
+Epoch 4 Validation | AUC: 0.8641966468145745, LogLoss: 0.22266629338264465
+Epoch 5 Validation | AUC: 0.8649472459418838, LogLoss: 0.22258137166500092
+Epoch 6 Validation | AUC: 0.8635087410949094, LogLoss: 0.22377458214759827
 Test AUC：
 ```
 
@@ -247,14 +252,24 @@ Epoch 2 Validation | AUC: 0.863329, LogLoss: 0.223689
 Epoch 3 Validation | AUC: 0.863973, LogLoss: 0.222719
 Epoch 4 Validation | AUC: 0.864003, LogLoss: 0.223151
 Epoch 5 Validation | AUC: 0.863648, LogLoss: 0.223132
-Test AUC：
+Epoch 6 Validation | AUC: 0.863579, LogLoss: 0.223120
+Test AUC：auc: 0.813019
 ```
 
-### main_v2_Act_TarDomaiLevelTimeWise
+
+
+### main_base (time context v1 + target_cate_hist)
 
 ```text
-
-Test AUC：
+Epoch 1 Validation | AUC: 0.858521, LogLoss: 0.227749
+Epoch 2 Validation | AUC: 0.862416, LogLoss: 0.223996
+Epoch 3 Validation | AUC: 0.863655, LogLoss: 0.223146
+Epoch 4 Validation | AUC: 0.863852, LogLoss: 0.223166
+Epoch 5 Validation | AUC: 0.864069, LogLoss: 0.223746
+Epoch 6 Validation | AUC: 0.863666, LogLoss: 0.222999
+Test AUC：0.8222
 ```
+
+
 
 </details>
