@@ -1063,6 +1063,10 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            if ts_padded is None:
+                result[f'{domain}_timestamp'] = torch.zeros(B, max_len, dtype=torch.long)
+            else:
+                result[f'{domain}_timestamp'] = torch.from_numpy(ts_padded.copy())
 
             if self.use_recent_activity:
                 self._write_recent_activity_features(

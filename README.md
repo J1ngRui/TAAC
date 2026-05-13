@@ -50,7 +50,7 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 
 ## TS / Time Context 优化 Timeline
 
-> 当前主线：`group tokenizer + time context v1 + target_cate_hist + recent_activity + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
+> 当前主线：`group tokenizer + time context v1 + target_cate_hist + recent_activity + global_target_timewise + BCE`。当前 time context 只保留 day 内周期与 week 周期，已删除 month 周期特征；Weighted Loss / WLoss 已从代码中删除，不再作为训练入口。
 
 | 序号 | 模型 / 实验名     | 背景 / 动机                                       | 结构 / 变更                                             | 结果                          | 增幅 / 降幅                                | 结论                                    |
 | ---: | :---------------- | :------------------------------------------------ | :------------------------------------------------------ | :---------------------------- | :----------------------------------------- | :-------------------------------------- |
@@ -63,33 +63,38 @@ Baseline 设计与 NS tokenizer 对比已拆到 [baseline.md](baseline.md)，REA
 |    6 | Time Shift        | valid-test gap 更像时间状态偏移问题。             | 加强 temporal shift 视角                                | anchor delta 负收益           | test  -0.000543                            | 保留“时间状态/偏移”这个建模思路。       |
 |    7 | TS4               | 尝试补充 month 周期信号。                         | day/week 周期 + month 周期                              | 持平                          | 持平                                       | month 周期已删除，回到 v1 day/week 口径。 |
 |    8 | WLoss             | 尝试缓解少量异常样本带来的 loss 震荡。            | BCE linear reweight / tail negative downweight          | logloss 有收益但 AUC 不稳     | test 明显下降                              | 已删除模块，当前只保留 BCE / focal 入口。 |
-|    9 | Target Hist Match | 需要比 item_id 更泛化的 target/history 匹配信号。 | time context v1 + target/history semantic match + BCE   | 待重跑干净口径                | 待验证                                     | 当前 active 结构方向。                  |
-|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | 待训练                     | 待验证                                     | 已从当前主线回退。                      |
-|   11 | Recent Activity   | 用户近期活跃度可能是强泛化信号。                  | 每路序列生成 last_delta / 1h / 1d / 7d count bucket，追加到最后一个 user NS group | 待训练 | 待验证 | 不新增 token，保持 `T=22,d_model=88`。 |
+|    9 | Target Hist Match | 需要比 item_id 更泛化的 target/history 匹配信号。 | time context v1 + target/history semantic match + BCE   | valid 0.864069 / test 0.8222 | vs 早期 best test +0.0010                  | 作为 clean main_base。                  |
+|   10 | Domain Time Mild  | 时间是强特征，但需要温和正则和分 domain 表达。    | target_cate_hist + domain time buckets + time dropout 0.02 | valid 0.864947 / test 未测  | valid 小幅提升，但缺少 test 证明            | 属于结构容量改动，泛化风险较高，不进主线。 |
+|   11 | Recent Activity   | 用户近期活跃度可能是强泛化信号。                  | 每路序列生成 last_delta / 1h / 1d / 7d count bucket，追加到最后一个 user NS group | clean A/B 已单独对照 | 低容量统计特征，不新增 token | 保留为低风险增益特征，继续用 test A/B 判断。 |
+|   12 | Global Target Timewise | target/history 需要表达近期趋势，但避免 per-domain 稀疏。 | target_cate_hist 后追加全局 last_position / recent_ratio / recent_trend bucket | clean A/B 已单独对照 | 比 per-domain timewise 更低风险 | 当前主线候选，优先保留 global 版本。 |
 
 
 
 ## A / B 实验对照
 
-> 对照口径：`best valid` 按验证集 AUC 最高 epoch 统计。`相对 Best Test` = Test AUC - 当前已测试最优 Test AUC，当前 best = 0.821200。
+> 对照口径：`best valid` 按验证集 AUC 最高 epoch 统计。`相对 Best Test` = Test AUC - 当前 clean main_base Test AUC，当前 best = 0.822200。
 
 | 实验 | 关键变更 | Best Valid AUC | Best Epoch | Test AUC | 相对 Best Test | 结论 |
 | :--- | :--- | ---: | ---: | ---: | ---: | :--- |
-| time context v1 + hybrid v1 | time context + hybrid 压缩 token | 0.864835 | 6 | **0.821200** | **+0.000000** | 当前已测试版本里 test 最好。 |
-| time context v1 | 移除 hybrid，保留原始 group token | **0.865527** | 5 | 0.820503 | -0.000697 | valid 最高，但 test 低于 hybrid，可能存在过拟合或 hybrid 有信息增强/正则效果。 |
+| time context v1 + hybrid v1 | time context + hybrid 压缩 token | 0.864835 | 6 | 0.821200 | -0.001000 | 早期 strong baseline，但已低于 main_base clean 口径。 |
+| time context v1 | 移除 hybrid，保留原始 group token | **0.865527** | 5 | 0.820503 | -0.001697 | valid 最高，但 test 低于 hybrid/main_base，存在过拟合风险。 |
 | time context v1 + anchor_time | 加入 anchor time 特征 | 0.864272 | 5 | 未测试 | - | valid 没超过 v1，不优先投入 test。 |
-| time context v1 + anchor_time + WLoss | anchor time + weighted loss | 0.864433 | 4 | 0.817130 | -0.004070 | anchor_time / WLoss 组合置信度不高。 |
-| time context v2 + WLoss | v2 time context + weighted loss | 0.864621 | 6 | 0.817673 | -0.003527 | valid 尚可，但 test 明显下降，排除。 |
-| time context v2 + WLoss + target_cate_hist | v2 + WLoss + target/history 类目匹配 | 0.863951 | 5 | 0.820517 | -0.000683 | target_cate_hist 对 test 有恢复信号，但 WLoss 拖累仍明显。 |
-| time context v2 | 纯 v2 time context | 0.864367 | 3 | 0.820265 | -0.000935 | 纯 v2 低于 v1 / v1 hybrid，暂不作为主线。 |
+| time context v1 + anchor_time + WLoss | anchor time + weighted loss | 0.864433 | 4 | 0.817130 | -0.005070 | anchor_time / WLoss 组合置信度不高。 |
+| time context v2 + WLoss | v2 time context + weighted loss | 0.864621 | 6 | 0.817673 | -0.004527 | valid 尚可，但 test 明显下降，排除。 |
+| time context v2 + WLoss + target_cate_hist | v2 + WLoss + target/history 类目匹配 | 0.863951 | 5 | 0.820517 | -0.001683 | target_cate_hist 对 test 有恢复信号，但 WLoss 拖累仍明显。 |
+| time context v2 | 纯 v2 time context | 0.864367 | 3 | 0.820265 | -0.001935 | 纯 v2 低于 v1 / v1 hybrid / main_base，暂不作为主线。 |
 | time context v2 + target_cate_hist | v2 + target/history 类目匹配，标准 BCE | 0.863920 | 5 | 未测试 | - | v2 本体已弱于 v1，是否继续测取决于是否单独验证 target_cate_hist。 |
+| main_base | time context v1 + target_cate_hist | 0.864069 | 5 | **0.822200** | **+0.000000** | 当前 clean anchor，作为后续 act / timewise A/B 基准。 |
+| main_v2 domain-time | domain time buckets + time dropout | 0.864947 | 5 | 未测试 | - | valid 小幅提升但属于结构容量改动，暂不进主线。 |
+| main_v2_Act | domain-time 口径上叠加 recent_activity | 0.864003 | 4 | 0.813019 | -0.009181 | 该口径 test 明显差，不能作为 act 独立收益证明。 |
 
 阶段判断：
 
-1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + recent_activity + BCE`。
+1. 当前模型主线固定为 `group + time context v1 + target_cate_hist + recent_activity + global_target_timewise + BCE`。
 2. `time context v1` 的 clean 口径保留 day 内周期与 week 周期，不再包含 month 周期特征。
-3. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
-4. 下一步重点是重跑当前 clean 主线，对照 `time context v1` 与 `time context v1 + hybrid v1` 的已知 test 结果。
+3. `domain_time_buckets` / `time_context_dropout` 属于结构容量改动，缺少强 test 收益证明，已从主线回退。
+4. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
+5. 当前 A/B 重点是 `main_base -> +act -> +global_target_timewise`，用 test 结果判断 act 与 global-timewise 的独立/边际收益。
 
 <details>
 <summary>逐 epoch 原始记录</summary>
@@ -256,9 +261,7 @@ Epoch 6 Validation | AUC: 0.863579, LogLoss: 0.223120
 Test AUC：auc: 0.813019
 ```
 
-
-
-### main_base (time context v1 + target_cate_hist)
+### main_base
 
 ```text
 Epoch 1 Validation | AUC: 0.858521, LogLoss: 0.227749
@@ -268,6 +271,24 @@ Epoch 4 Validation | AUC: 0.863852, LogLoss: 0.223166
 Epoch 5 Validation | AUC: 0.864069, LogLoss: 0.223746
 Epoch 6 Validation | AUC: 0.863666, LogLoss: 0.222999
 Test AUC：0.8222
+```
+
+### main_act
+
+```text
+Epoch 1 Validation | AUC: 0.8603662543367118, LogLoss: 0.22632908821105957
+Epoch 2 Validation | AUC: 0.8634899570252379, LogLoss: 0.2238776534795761
+Epoch 3 Validation | AUC: 0.8626868315906825, LogLoss: 0.2239682674407959
+Test AUC：
+```
+
+### main_act_tw
+
+```text
+Epoch 1 Validation | AUC: 0.8610583151030166, LogLoss: 0.22613883018493652
+Epoch 2 Validation | AUC: 0.86285897109939, LogLoss: 0.22348769009113312
+Epoch 3 Validation | AUC: 0.8643120435941974, LogLoss: 0.22277097404003143
+Test AUC：
 ```
 
 

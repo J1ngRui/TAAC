@@ -295,3 +295,283 @@ all_Q: (B, 8, 88)
 
 因此 baseline 里 `num_queries=2` 表示给每一路历史提供两个可学习的查询槽位。代码没有显式规定这两个 Query 分别代表长期兴趣、短期兴趣或 target-aware 兴趣；它们是否学出不同关注角度，主要由独立参数初始化和后续 cross attention / RankMixer 的训练信号决定。
 
+
+
+## 四、MultiSeqHyFormerBlock
+
+`MultiSeqHyFormerBlock` 是 Q token、S token、NS token 真正发生交互的地方。
+
+整体流程可以拆成三步：
+
+```text
+每一路 S token
+-> Sequence Evolution：先做序列内部建模，得到 encoded S token
+-> Query Decoding：该路 Q token attend 该路 encoded S token
+
+所有 decoded Q + NS token
+-> RankMixer / Query Boosting：跨路 Q token 与 NS token 融合
+-> split 回每一路 Q token 和共享 NS token
+```
+
+输入形状：
+
+```text
+q_tokens_list:
+  seq_a Q: (B, num_queries, d_model)
+  seq_b Q: (B, num_queries, d_model)
+  seq_c Q: (B, num_queries, d_model)
+  seq_d Q: (B, num_queries, d_model)
+
+ns_tokens:
+  (B, num_ns, d_model)
+
+seq_tokens_list:
+  seq_a S: (B, L_a, d_model)
+  seq_b S: (B, L_b, d_model)
+  seq_c S: (B, L_c, d_model)
+  seq_d S: (B, L_d, d_model)
+```
+
+## Query Decoding / Cross Attention
+
+Query Decoding 的作用是让每一路 Q token 从对应 domain 的历史 S token 中读取信息。
+
+对第 `i` 路 sequence，处理流程是：
+
+1. 先用对应的 `seq_encoder[i]` 对 `seq_tokens_list[i]` 做 Sequence Evolution。
+2. 得到 `encoded_seq_i`，形状为 `(B, L_i', d_model)`。
+3. 取该路的 `Q_i` 作为 attention query。
+4. 取 `encoded_seq_i` 同时作为 key 和 value。
+5. 使用 `seq_padding_mask_i` 屏蔽 padding 位置。
+6. 如果启用 RoPE，则 RoPE 只作用在 sequence 的 K/V 侧。
+7. attention 输出和原始 `Q_i` 做 residual add，得到 `decoded_Q_i`。
+
+公式近似为：
+
+```text
+residual = Q_i
+Q_i_norm = LayerNorm(Q_i)
+S_i_norm = LayerNorm(encoded_seq_i)
+
+attn_out = CrossAttention(
+    query = Q_i_norm,
+    key   = S_i_norm,
+    value = S_i_norm,
+    key_padding_mask = seq_mask_i
+)
+
+decoded_Q_i = residual + attn_out
+```
+
+输出形状：
+
+```text
+decoded_Q_i: (B, num_queries, d_model)
+```
+
+建模含义：
+
+`Q_i` 是该路历史的可学习读取槽位。它不是简单地把整条历史池化成一个向量，而是通过 cross attention 在该 domain 的所有有效历史位置上分配权重，从而读取和当前样本上下文相关的信息。
+
+需要注意的是，当前 cross attention 是 **每一路 domain 独立做的**：
+
+```text
+seq_a Q 只 attend seq_a encoded S
+seq_b Q 只 attend seq_b encoded S
+seq_c Q 只 attend seq_c encoded S
+seq_d Q 只 attend seq_d encoded S
+```
+
+不同 domain 之间不会在 cross attention 阶段直接互相 attend。跨 domain 的信息融合被放到后面的 RankMixer 里。
+
+## RankMixer / Query Boosting
+
+RankMixer 的作用是把所有 domain 读出来的 `decoded_Q` 和全局 `NS token` 放到同一个 token 序列里做融合。
+
+进入 RankMixer 前，模型会先拼接：
+
+```text
+combined = concat(
+    decoded_Q_seq_a,
+    decoded_Q_seq_b,
+    decoded_Q_seq_c,
+    decoded_Q_seq_d,
+    ns_tokens
+)
+
+combined: (B, num_queries * num_sequences + num_ns, d_model)
+combined: (B, T, D)
+```
+
+在当前 active 配置下：
+
+```text
+decoded Q tokens = 2 * 4 = 8
+NS tokens        = 14
+T                = 22
+D                = 88
+combined         = (B, 22, 88)
+```
+
+`RankMixerBlock` 接收的就是这个 `combined`：
+
+```text
+RankMixerBlock.forward(Q)
+Q: (B, T, D)
+```
+
+`RankMixerBlock` 支持三种模式：
+
+```text
+--rank_mixer_mode full      # token mixing + per-token FFN
+--rank_mixer_mode ffn_only  # 只做 per-token FFN
+--rank_mixer_mode none      # identity passthrough
+```
+
+### Token Mixing
+
+`full` 模式下，RankMixer 先做一次无参数的 token mixing。
+
+它要求 `D` 能被 token 总数 `T` 整除，并定义：
+
+```text
+d_sub = D / T
+```
+
+处理方式：
+
+1. 输入 `combined`，形状为 `(B, T, D)`，其中第一个 `T` 是 token 数。
+2. 因为 `D = T * d_sub`，所以把每个 token 的通道维拆成 `T` 个子空间。这里第二个 `T` 是 channel 子空间数，数值上等于 token 数，但语义上是另一条轴：
+
+```text
+(B, token_T, D) -> (B, token_T, subspace_T, d_sub)
+```
+
+3. 交换 token 轴和子空间轴：
+
+```text
+(B, token_T, subspace_T, d_sub)
+-> (B, subspace_T, token_T, d_sub)
+```
+
+4. 再 flatten 回 token 表达：
+
+```text
+(B, subspace_T, token_T, d_sub) -> (B, T, D)
+```
+
+这一步没有新增参数。本质上，原来的第 `j` 个 channel 子空间会变成新的第 `j` 个 token；新的每个 token 都由所有原始 token 的同一个子空间拼接而成。因此它不是 attention，也不是 learned projection，而是一次固定的 token/channel 轴重排。
+
+### Per-token FFN + Residual
+
+token mixing 之后，RankMixer 会把重排后的 `Q_hat` 送进一个共享参数的 per-token FFN。
+
+FFN 的输入仍然是 token 序列：
+
+```text
+Q_hat: (B, T, D)
+```
+
+`nn.Linear` 作用在最后一维 `D` 上，所以它会对每个 token 的 `D` 维表示做同一套 MLP 变换：
+
+```text
+(B, T, D)
+-> Linear(D, D * hidden_mult)
+-> GELU
+-> Dropout
+-> Linear(D * hidden_mult, D)
+-> (B, T, D)
+```
+
+它不会把 `T` 个 token flatten 成一个大向量，也不会为不同 token 创建不同 FFN 参数。不同 token 之间的交互主要来自前面的 token mixing；FFN 负责对混合后的每个 token 做非线性增强。
+
+完整流程是：
+
+```text
+Q     = combined                         # (B, T, D)
+Q_hat = token_mixing(Q)                  # (B, T, D), full mode
+# 如果 mode=ffn_only，则 Q_hat = Q
+
+x = LayerNorm(Q_hat)
+x = Linear(D, D * hidden_mult)
+x = GELU(x)
+x = Dropout(x)
+Q_e = Linear(D * hidden_mult, D)
+
+boosted = Q + Q_e
+boosted = LayerNorm(boosted)
+```
+
+输出形状保持不变：
+
+```text
+boosted: (B, T, D)
+```
+
+这里的 residual 是从原始输入 `Q` 加到 FFN 输出 `Q_e` 上，而不是从 `Q_hat` 加回去。这样做的含义是：token mixing 只负责产生增强分支里的交互信息，主路径仍然保留原始 `combined` token 序列。
+
+建模含义：
+
+RankMixer 负责让不同来源的 token 发生全局融合：
+
+1. 不同 domain 的 decoded Q token 可以互相交换信息。
+2. Q token 可以吸收 NS token 中的用户属性、item 属性、dense 特征、time context、target-hist match 等上下文。
+3. NS token 也会被 Q token 更新，进入下一层 block 时携带更多历史交互后的信息。
+
+也就是说，cross attention 阶段解决“每一路 Q 如何读自己的历史”，RankMixer 阶段解决“多路历史读出来的信息如何与全局上下文融合”。
+
+## Block Stack / Final Output
+
+`PCVRHyFormer` 会堆叠多个 `MultiSeqHyFormerBlock`：
+
+```text
+curr_qs, curr_ns, curr_seqs, curr_masks = block(
+    q_tokens_list = curr_qs,
+    ns_tokens = curr_ns,
+    seq_tokens_list = curr_seqs,
+    seq_padding_masks = curr_masks
+)
+```
+
+每一层 block 的输出会作为下一层 block 的输入：
+
+```text
+Q tokens:  被 cross attention 和 RankMixer 更新
+NS tokens: 被 RankMixer 更新
+S tokens:  被 sequence encoder 更新
+mask:      如果使用 LongerEncoder，可能随 top-k 压缩同步更新
+```
+
+所有 block 结束后，模型只取最终的 Q tokens 作为主输出：
+
+```text
+all_q = concat(curr_qs, dim=1)      # (B, num_queries * num_sequences, D)
+all_q = all_q.view(B, -1)           # (B, num_queries * num_sequences * D)
+output = output_proj(all_q)         # (B, D)
+logits = classifier(output)         # (B, action_num)
+```
+
+当前 active 配置下：
+
+```text
+all_q:  (B, 8, 88)
+flat:   (B, 704)
+output: (B, 88)
+logits: (B, 1)
+```
+
+这里最终不直接 concat NS token 输出，而是让 NS token 在每层 RankMixer 中参与更新 Q token。最后的预测由 Q token 汇总后的表示完成。
+
+整体信息流可以概括为：
+
+```text
+NS tokens + S tokens
+-> Query Generator 生成初始 Q
+-> 每层 block:
+   1. S token 做序列内部建模
+   2. Q token attend 对应 domain 的 S token
+   3. decoded Q 和 NS token 进入 RankMixer 全局融合
+-> concat 最终 Q
+-> output projection
+-> classifier
+```

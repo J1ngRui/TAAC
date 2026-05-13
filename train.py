@@ -195,6 +195,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
                         help='Timezone offset used for timestamp cyclic features '
                              '(default: 8.0 for UTC+8)')
+    parser.add_argument('--use_period_time_refine', action='store_true', default=True,
+                        help='Refine seq time-bucket embeddings with historical hour/day embeddings')
+    parser.add_argument('--no_period_time_refine', dest='use_period_time_refine',
+                        action='store_false',
+                        help='Disable historical hour/day refinement of seq time buckets')
     parser.add_argument('--use_target_hist_match', action='store_true', default=False,
                         help='Append target-category/history-category matching bucket features '
                              'as a dedicated item NS group')
@@ -479,6 +484,7 @@ def main() -> None:
         "seq_id_threshold": args.seq_id_threshold,
         "use_time_context": args.use_time_context,
         "time_context_tz_offset_hours": args.time_context_tz_offset_hours,
+        "use_period_time_refine": args.use_period_time_refine,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "ns_hybrid_mode": args.ns_hybrid_mode,
         "user_ns_tokens": args.user_ns_tokens,

@@ -17,6 +17,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_timestamps: dict  # {domain: tensor [B, L]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1378,6 +1379,7 @@ class PCVRHyFormer(nn.Module):
         seq_id_threshold: int = 10000,
         use_time_context: bool = False,
         time_context_tz_offset_hours: float = 8.0,
+        use_period_time_refine: bool = False,
         # Tokenizer variants
         ns_tokenizer_type: str = 'group',
         ns_hybrid_mode: str = 'learnQ',
@@ -1399,6 +1401,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
+        self.use_period_time_refine = bool(use_period_time_refine and num_time_buckets > 0)
         self.ns_tokenizer_type = ns_tokenizer_type
         self.ns_hybrid_mode = ns_hybrid_mode
         self._hybrid_group_shapes_logged = False
@@ -1562,6 +1565,18 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+            if self.use_period_time_refine:
+                self.hist_hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+                self.hist_day_embedding = nn.Embedding(8, d_model, padding_idx=0)
+                refine_dim = d_model * 3
+                hidden_dim = d_model * hidden_mult
+                self.period_refine_norm = nn.LayerNorm(refine_dim)
+                self.period_refine_delta = nn.Sequential(
+                    nn.Linear(refine_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, d_model),
+                )
+                self.period_refine_gate = nn.Linear(refine_dim, d_model)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1652,6 +1667,16 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+            if self.use_period_time_refine:
+                nn.init.xavier_normal_(self.hist_hour_embedding.weight.data)
+                self.hist_hour_embedding.weight.data[0, :] = 0
+                nn.init.xavier_normal_(self.hist_day_embedding.weight.data)
+                self.hist_day_embedding.weight.data[0, :] = 0
+                final = self.period_refine_delta[-1]
+                nn.init.zeros_(final.weight)
+                nn.init.zeros_(final.bias)
+                nn.init.xavier_normal_(self.period_refine_gate.weight)
+                nn.init.constant_(self.period_refine_gate.bias, -2.0)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1706,9 +1731,11 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding is always preserved
+        # time/period embeddings are always preserved
         if self.num_time_buckets > 0:
             skip_count += 1
+            if self.use_period_time_refine:
+                skip_count += 2
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1754,6 +1781,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        seq_timestamps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1772,11 +1800,51 @@ class PCVRHyFormer(nn.Module):
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
-        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
+        # Add refined time embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
-            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+            token_emb = token_emb + self._build_refined_time_embedding(
+                time_bucket_ids, seq_timestamps
+            )
 
         return token_emb
+
+    def _build_seq_period_ids(
+        self,
+        seq_timestamps: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build local hour/day ids for historical sequence timestamps."""
+        valid = seq_timestamps > 0
+        offset_seconds = int(round(float(self.time_context_tz_offset_hours) * 3600.0))
+        local_ts = seq_timestamps.long() + offset_seconds
+        seconds_per_day = 86400
+        seconds_of_day = torch.remainder(local_ts, seconds_per_day)
+        hour_ids = torch.div(seconds_of_day, 3600, rounding_mode='floor') + 1
+        day_index = torch.div(local_ts, seconds_per_day, rounding_mode='floor')
+        day_ids = torch.remainder(day_index + 3, 7) + 1
+        hour_ids = torch.where(valid, hour_ids, torch.zeros_like(hour_ids))
+        day_ids = torch.where(valid, day_ids, torch.zeros_like(day_ids))
+        return hour_ids.long(), day_ids.long()
+
+    def _build_refined_time_embedding(
+        self,
+        time_bucket_ids: torch.Tensor,
+        seq_timestamps: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Refine recency bucket embeddings with historical hour/day context."""
+        time_emb = self.time_embedding(time_bucket_ids)
+        if not self.use_period_time_refine:
+            return time_emb
+
+        if seq_timestamps is None:
+            seq_timestamps = torch.zeros_like(time_bucket_ids)
+        hour_ids, day_ids = self._build_seq_period_ids(seq_timestamps)
+        hour_emb = self.hist_hour_embedding(hour_ids)
+        day_emb = self.hist_day_embedding(day_ids)
+        refine_input = torch.cat([time_emb, hour_emb, day_emb], dim=-1)
+        refine_input = self.period_refine_norm(refine_input)
+        delta = self.period_refine_delta(refine_input)
+        gate = torch.sigmoid(self.period_refine_gate(refine_input))
+        return time_emb + gate * delta
 
     def _make_padding_mask(
         self, seq_len: torch.Tensor, max_len: int
@@ -1918,7 +1986,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_timestamps.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1949,7 +2018,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_timestamps.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

@@ -62,6 +62,7 @@ _MODEL_CFG_KEYS = [
     'seq_id_threshold',
     'use_time_context',
     'time_context_tz_offset_hours',
+    'use_period_time_refine',
     'ns_tokenizer_type',
     'ns_hybrid_mode',
     'user_ns_tokens',
@@ -201,6 +202,10 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
                     "train_config missing both 'num_time_buckets' and "
                     "'use_time_buckets'; cannot rebuild model structure."
                 )
+            continue
+
+        if key == 'use_period_time_refine' and key not in train_config:
+            cfg[key] = False
             continue
 
         if key in train_config:
@@ -386,12 +391,16 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_timestamps: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
         B, _, L = device_batch[domain].shape
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_timestamps[domain] = device_batch.get(
+            f'{domain}_timestamp',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
     return ModelInput(
@@ -403,6 +412,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_timestamps=seq_timestamps,
     )
 
 
