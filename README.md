@@ -183,7 +183,20 @@ Test AUC: 未测试，因为v2不如v1
 <details>
 <summary>Main epoch 记录</summary>
 
-### main_base (time context v1 + target_cate_hist)
+### main_prev （time context v1）
+
+
+```
+Epoch 1 Validation | AUC: 0.8589916953859507, LogLoss: 0.22725152969360352
+Epoch 2 Validation | AUC: 0.8634527978728386, LogLoss: 0.22394008934497833
+Epoch 3 Validation | AUC: 0.8643401958003973, LogLoss: 0.22323431074619293
+Epoch 4 Validation | AUC: 0.864563507016832, LogLoss: 0.22325144708156586
+Epoch 5 Validation | AUC: 0.8655272198441499, LogLoss: 0.22246094048023224
+Epoch 6 Validation | AUC: 0.8651004818893825, LogLoss: 0.22271838784217834
+Test AUC：0.8212
+```
+
+### main_base （time context v1 + target_cate_hist）
 
 
 ```text
@@ -205,6 +218,24 @@ Epoch 3 Validation | AUC: 0.8642881203021332, LogLoss: 0.22289903461933136
 Epoch 4 Validation | AUC: 0.8653365021171011, LogLoss: 0.22231131792068481
 Epoch 5 Validation | AUC: 0.8641097150917216, LogLoss: 0.22321653366088867
 Test AUC：0.821239
+```
+
+### main_ref
+
+```text
+Epoch 1 Validation | AUC: 0.8602357429639006, LogLoss: 0.22603169083595276
+```
+
+### main_miss
+
+```text
+Epoch 1 Validation | AUC: 0.8589506321191401, LogLoss: 0.22670724987983704
+```
+
+### main_trendc
+
+```text
+
 ```
 
 </details>
