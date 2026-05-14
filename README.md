@@ -197,10 +197,8 @@ Test AUC: 未测试，因为v2不如v1
 
 <details>
 <summary>Main epoch 记录</summary>
-
 ### main_base (time context v1 + target_cate_hist)
 
-
 ```text
 Epoch 1 Validation | AUC: 0.858521, LogLoss: 0.227749
 Epoch 2 Validation | AUC: 0.862416, LogLoss: 0.223996
@@ -211,84 +209,15 @@ Epoch 6 Validation | AUC: 0.863666, LogLoss: 0.222999
 Test AUC：0.8222
 ```
 
-### main_hybrid_ns_self
+### main_gact
 
 ```text
-Epoch 1 Validation | AUC: 0.859000, LogLoss: 0.227512
-Epoch 2 Validation | AUC: 0.862230, LogLoss: 0.227064
-Epoch 3 Validation | AUC: 0.863340, LogLoss: 0.224158
-Epoch 4 Validation | AUC: 0.863180, LogLoss: 0.223397
-Epoch 5 Validation | AUC: 0.864470, LogLoss: 0.222976
-Epoch 6 Validation | AUC: 0.864040, LogLoss: 0.223229
-Test AUC：
+Epoch 1 Validation | AUC: 0.8610430630945604, LogLoss: 0.22593118250370026
+Epoch 2 Validation | AUC: 0.8641009270322928, LogLoss: 0.22306373715400696
+Epoch 3 Validation | AUC: 0.8642881203021332, LogLoss: 0.22289903461933136
+Epoch 4 Validation | AUC: 0.8653365021171011, LogLoss: 0.22231131792068481
+Epoch 5 Validation | AUC: 0.8641097150917216, LogLoss: 0.22321653366088867
+Test AUC：0.821239
 ```
-
-### main_hybrid_ns_learnQ
-
-```text
-Epoch 1 Validation | AUC: 0.859421, LogLoss: 0.226930
-Epoch 2 Validation | AUC: 0.861414, LogLoss: 0.224316
-Epoch 3 Validation | AUC: 0.862625, LogLoss: 0.224154
-Epoch 4 Validation | AUC: 0.863670, LogLoss: 0.223041
-Epoch 5 Validation | AUC: 0.864177, LogLoss: 0.222886
-Epoch 6 Validation | AUC: 0.864850, LogLoss: 0.222479
-Test AUC：
-```
-
-### main_v2 (domain-only emb)
-
-```text
-Epoch 1 Validation | AUC: 0.8599513096535375, LogLoss: 0.22652412950992584
-Epoch 2 Validation | AUC: 0.8627960718404153, LogLoss: 0.22386665642261505
-Epoch 3 Validation | AUC: 0.8631914155663172, LogLoss: 0.2236473262310028
-Epoch 4 Validation | AUC: 0.8641966468145745, LogLoss: 0.22266629338264465
-Epoch 5 Validation | AUC: 0.8649472459418838, LogLoss: 0.22258137166500092
-Epoch 6 Validation | AUC: 0.8635087410949094, LogLoss: 0.22377458214759827
-Test AUC：
-```
-
-### main_v2_Act
-
-```text
-Epoch 1 Validation | AUC: 0.861214, LogLoss: 0.225494
-Epoch 2 Validation | AUC: 0.863329, LogLoss: 0.223689
-Epoch 3 Validation | AUC: 0.863973, LogLoss: 0.222719
-Epoch 4 Validation | AUC: 0.864003, LogLoss: 0.223151
-Epoch 5 Validation | AUC: 0.863648, LogLoss: 0.223132
-Epoch 6 Validation | AUC: 0.863579, LogLoss: 0.223120
-Test AUC：auc: 0.813019
-```
-
-### main_base
-
-```text
-Epoch 1 Validation | AUC: 0.858521, LogLoss: 0.227749
-Epoch 2 Validation | AUC: 0.862416, LogLoss: 0.223996
-Epoch 3 Validation | AUC: 0.863655, LogLoss: 0.223146
-Epoch 4 Validation | AUC: 0.863852, LogLoss: 0.223166
-Epoch 5 Validation | AUC: 0.864069, LogLoss: 0.223746
-Epoch 6 Validation | AUC: 0.863666, LogLoss: 0.222999
-Test AUC：0.8222
-```
-
-### main_act
-
-```text
-Epoch 1 Validation | AUC: 0.8603662543367118, LogLoss: 0.22632908821105957
-Epoch 2 Validation | AUC: 0.8634899570252379, LogLoss: 0.2238776534795761
-Epoch 3 Validation | AUC: 0.8626868315906825, LogLoss: 0.2239682674407959
-Test AUC：
-```
-
-### main_act_tw
-
-```text
-Epoch 1 Validation | AUC: 0.8610583151030166, LogLoss: 0.22613883018493652
-Epoch 2 Validation | AUC: 0.86285897109939, LogLoss: 0.22348769009113312
-Epoch 3 Validation | AUC: 0.8643120435941974, LogLoss: 0.22277097404003143
-Test AUC：
-```
-
-
 
 </details>
