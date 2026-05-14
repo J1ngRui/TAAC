@@ -106,12 +106,6 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# Discrete feature ids reserve separate slots for structural padding, missing,
-# and real raw values. This keeps meaningful raw 0 buckets distinct from null/-1.
-DISCRETE_PADDING_ID = 0
-DISCRETE_MISSING_ID = 1
-DISCRETE_VALUE_OFFSET = 2
-
 # Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
 BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
@@ -141,8 +135,7 @@ NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
 
-    - int features: scalar or list (multi-hot); 0 is structural padding,
-      1 is missing, and raw values are shifted by +2.
+    - int features: scalar or list (multi-hot); values <= 0 are mapped to 0 (padding).
     - dense features: ``list<float>``, variable-length padded up to ``max_dim``.
     - sequence features: ``list<int64>``, grouped by domain; includes side-info
       columns and an optional timestamp column (used for time-bucketing).
@@ -156,7 +149,6 @@ class PCVRParquetDataset(IterableDataset):
         batch_size: int = 256,
         seq_max_lens: Optional[Dict[str, int]] = None,
         target_hist_match_config: Optional[Dict[str, Any]] = None,
-        recent_activity_config: Optional[Dict[str, Any]] = None,
         shuffle: bool = True,
         buffer_batches: int = 20,
         row_group_range: Optional[Tuple[int, int]] = None,
@@ -202,13 +194,6 @@ class PCVRParquetDataset(IterableDataset):
         self.target_hist_match_config = target_hist_match_config or {}
         self.use_target_hist_match = bool(
             self.target_hist_match_config.get('enabled', False)
-        )
-        self.recent_activity_config = recent_activity_config or {}
-        self.use_recent_activity = bool(
-            self.recent_activity_config.get('enabled', False)
-        )
-        self.recent_activity_mode = str(
-            self.recent_activity_config.get('mode', 'per_domain')
         )
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
@@ -360,11 +345,6 @@ class PCVRParquetDataset(IterableDataset):
         if self.use_target_hist_match:
             self._init_target_hist_match_schema()
 
-        self.recent_activity_feature_ids: List[int] = []
-        self._recent_activity_offset = self.user_int_schema.total_dim
-        if self.use_recent_activity:
-            self._init_recent_activity_schema()
-
     def _init_target_hist_match_schema(self) -> None:
         """Append dynamic target-history matching features to item_int schema."""
         required = [
@@ -379,12 +359,10 @@ class PCVRParquetDataset(IterableDataset):
             )
 
         feature_fids = list(self.target_hist_match_config['feature_fids'])
-        timewise_count = 7
-        if len(feature_fids) not in (4, timewise_count):
+        if len(feature_fids) != 4:
             raise ValueError(
-                "target_hist_match_config['feature_fids'] must contain either "
-                f"4 fids for target_cate_match_v1 or {timewise_count} fids "
-                "for target_cate_state timewise features"
+                "target_hist_match_config['feature_fids'] must contain 4 fids "
+                "for target_cate_match_v1 features"
             )
 
         existing = set(self.item_int_schema.feature_ids)
@@ -394,25 +372,14 @@ class PCVRParquetDataset(IterableDataset):
                 f"target_hist_match feature fids already exist in item_int schema: {dup}"
             )
 
-        self.target_hist_match_recent_k = int(
-            self.target_hist_match_config.get('recent_k', 64)
-        )
-
         # Max bucket ids for:
         # cate_in_hist, cate_count_bucket, cate_ratio_bucket,
-        # cate_last_time_delta_bucket, then optional:
-        # cate_last_position_delta_bucket, cate_recent_ratio_bucket,
-        # cate_recent_trend_bucket.
+        # cate_last_delta_bucket.
         vocab_sizes = [1, 5, 4, 5]
-        if len(feature_fids) == timewise_count:
-            vocab_sizes += [7, 5, 5]
-        self._target_hist_match_vocab_sizes = vocab_sizes
         for fid, vs in zip(feature_fids, vocab_sizes):
             self.item_int_schema.add(int(fid), 1)
             self.item_int_vocab_sizes.append(vs)
         self.target_hist_match_feature_ids = [int(fid) for fid in feature_fids]
-        self._target_hist_match_feature_count = len(feature_fids)
-        self._target_hist_match_has_timewise = len(feature_fids) == timewise_count
 
         target_cate_fid = int(self.target_hist_match_config['target_cate_item_fid'])
         self._target_cate_offset, self._target_cate_dim = (
@@ -432,57 +399,6 @@ class PCVRParquetDataset(IterableDataset):
                     f"hist_cate_seq_fids[{domain}]={fid} not found in that sequence domain"
                 )
             self._target_hist_cate_slots[domain] = self._seq_fid_to_slot[domain][fid]
-
-    def _init_recent_activity_schema(self) -> None:
-        """Append dynamic recent-activity bucket features to user_int schema."""
-        feature_fids = list(self.recent_activity_config.get('feature_fids', []))
-        windows_seconds = list(
-            self.recent_activity_config.get('windows_seconds', [3600, 86400, 7 * 86400])
-        )
-        self.recent_activity_mode = str(
-            self.recent_activity_config.get('mode', 'per_domain')
-        )
-        if self.recent_activity_mode not in ('per_domain', 'global'):
-            raise ValueError(
-                "recent_activity_config['mode'] must be 'per_domain' or 'global'"
-            )
-        features_per_group = 1 + len(windows_seconds)
-        expected = features_per_group
-        if self.recent_activity_mode == 'per_domain':
-            expected *= len(self.seq_domains)
-        if len(feature_fids) != expected:
-            raise ValueError(
-                "recent_activity_config['feature_fids'] must contain "
-                f"{expected} fids for mode={self.recent_activity_mode}: "
-                f"one last_delta bucket plus {len(windows_seconds)} recent-count buckets"
-                + (
-                    f" for each of {len(self.seq_domains)} domains"
-                    if self.recent_activity_mode == 'per_domain'
-                    else ""
-                )
-            )
-
-        existing = set(self.user_int_schema.feature_ids)
-        dup = [fid for fid in feature_fids if fid in existing]
-        if dup:
-            raise ValueError(
-                f"recent_activity feature fids already exist in user_int schema: {dup}"
-            )
-
-        for fid in feature_fids:
-            self.user_int_schema.add(int(fid), 1)
-            self.user_int_vocab_sizes.append(5)
-        self.recent_activity_feature_ids = [int(fid) for fid in feature_fids]
-        self._recent_activity_vocab_sizes = [5] * len(feature_fids)
-        self.recent_activity_windows_seconds = [int(w) for w in windows_seconds]
-        self._recent_activity_features_per_group = features_per_group
-        self._recent_activity_features_per_domain = features_per_group
-        self._recent_activity_domain_offset = {}
-        if self.recent_activity_mode == 'per_domain':
-            self._recent_activity_domain_offset = {
-                domain: self._recent_activity_offset + i * self._recent_activity_features_per_group
-                for i, domain in enumerate(self.seq_domains)
-            }
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -546,13 +462,11 @@ class PCVRParquetDataset(IterableDataset):
         col_idx: int,
         arr: "npt.NDArray[np.int64]",
         vocab_size: int,
-        valid_mask: Optional["npt.NDArray[np.bool_]"] = None,
-        clip_value: int = DISCRETE_PADDING_ID,
     ) -> None:
-        """Record out-of-bound indices and optionally clip them in-place."""
-        oob_mask = arr > vocab_size
-        if valid_mask is not None:
-            oob_mask &= valid_mask
+        """Record out-of-bound indices and (optionally) clip them to 0,
+        without printing to the console.
+        """
+        oob_mask = arr >= vocab_size
         if not oob_mask.any():
             return
         key = (group, col_idx)
@@ -570,66 +484,12 @@ class PCVRParquetDataset(IterableDataset):
                 'count': n, 'max': mx, 'min_oob': mn, 'vocab': vocab_size,
             }
         if self.clip_vocab:
-            arr[oob_mask] = clip_value
+            arr[oob_mask] = 0
         else:
             raise ValueError(
                 f"{group} col_idx={col_idx}: {n} values out of range "
-                f"[0, {vocab_size}], actual=[{mn}, {mx}]. "
+                f"[0, {vocab_size}), actual=[{mn}, {mx}]. "
                 f"Use clip_vocab=True to clip or fix schema.json")
-
-    def _encode_discrete_values(
-        self,
-        arr: "npt.NDArray[np.int64]",
-        vocab_size: int,
-        group: str,
-        col_idx: int,
-        padding_mask: Optional["npt.NDArray[np.bool_]"] = None,
-    ) -> "npt.NDArray[np.int64]":
-        """Encode raw discrete ids while preserving missing vs raw zero.
-
-        Encoded ids:
-          0 = structural padding
-          1 = null / negative raw value / clipped OOB
-          raw value k >= 0 -> k + 2
-        """
-        encoded = np.zeros(arr.shape, dtype=np.int64)
-        if vocab_size <= 0:
-            return encoded
-
-        if padding_mask is None:
-            non_padding = np.ones(arr.shape, dtype=bool)
-        else:
-            non_padding = ~padding_mask
-
-        valid_raw = non_padding & (arr >= 0)
-        self._record_oob(
-            group, col_idx, arr, vocab_size,
-            valid_mask=valid_raw, clip_value=-1,
-        )
-
-        missing = non_padding & (arr < 0)
-        values = non_padding & (arr >= 0)
-        encoded[missing] = DISCRETE_MISSING_ID
-        encoded[values] = arr[values] + DISCRETE_VALUE_OFFSET
-        return encoded
-
-    def _encode_discrete_feature_parts(
-        self,
-        feat_parts: List["npt.NDArray[np.int64]"],
-        vocab_sizes: List[int],
-        feature_ids: List[int],
-        group: str,
-    ) -> List["npt.NDArray[np.int64]"]:
-        """Encode a list of derived scalar discrete feature columns."""
-        return [
-            self._encode_discrete_values(
-                np.asarray(part, dtype=np.int64).copy(),
-                int(vs),
-                group,
-                int(fid),
-            )
-            for part, vs, fid in zip(feat_parts, vocab_sizes, feature_ids)
-        ]
 
     def dump_oob_stats(self, path: Optional[str] = None) -> None:
         """Dump out-of-bound statistics to a file if ``path`` is provided,
@@ -661,15 +521,15 @@ class PCVRParquetDataset(IterableDataset):
     ) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
         """Pad an Arrow ``ListArray`` of ints to shape ``[B, max_len]``.
 
-        Values are copied as raw ids. Structural padding is represented by the
-        returned lengths; callers encode negative values as missing separately.
+        Values <= 0 are mapped to 0 (padding). Note: the raw data contains -1
+        (missing); currently treated the same way as 0 (padding).
 
         Returns:
             A tuple ``(padded, lengths)`` where ``padded`` has shape
             ``[B, max_len]`` and ``lengths`` has shape ``[B]``.
         """
         offsets = arrow_col.offsets.to_numpy()
-        values = arrow_col.values.fill_null(-1).to_numpy(zero_copy_only=False)
+        values = arrow_col.values.to_numpy()
 
         padded = np.zeros((B, max_len), dtype=np.int64)
         lengths = np.zeros(B, dtype=np.int64)
@@ -683,6 +543,7 @@ class PCVRParquetDataset(IterableDataset):
             padded[i, :use_len] = values[start:start + use_len]
             lengths[i] = use_len
 
+        padded[padded <= 0] = 0
         return padded, lengths
 
     # Backwards-compatible alias kept for bench_raw_dataset.py and other
@@ -748,61 +609,6 @@ class PCVRParquetDataset(IterableDataset):
         bucket[valid & (delta_seconds > 30 * 86400)] = 5
         return bucket
 
-    @staticmethod
-    def _bucket_target_recent_rate(rate: "npt.NDArray[np.float32]") -> "npt.NDArray[np.int64]":
-        bucket = np.zeros(rate.shape, dtype=np.int64)
-        bucket[(rate > 0.0) & (rate <= 0.05)] = 1
-        bucket[(rate > 0.05) & (rate <= 0.10)] = 2
-        bucket[(rate > 0.10) & (rate <= 0.20)] = 3
-        bucket[(rate > 0.20) & (rate <= 0.40)] = 4
-        bucket[rate > 0.40] = 5
-        return bucket
-
-    @staticmethod
-    def _bucket_target_trend(
-        trend: "npt.NDArray[np.float32]",
-        hist_len: "npt.NDArray[np.int64]",
-    ) -> "npt.NDArray[np.int64]":
-        bucket = np.zeros(trend.shape, dtype=np.int64)  # 0 = no_history
-        valid = hist_len > 0
-        bucket[valid & (trend <= -0.10)] = 1
-        bucket[valid & (trend > -0.10) & (trend < -0.03)] = 2
-        bucket[valid & (trend >= -0.03) & (trend <= 0.03)] = 3
-        bucket[valid & (trend > 0.03) & (trend <= 0.10)] = 4
-        bucket[valid & (trend > 0.10)] = 5
-        return bucket
-
-    @staticmethod
-    def _bucket_target_position_delta(delta: "npt.NDArray[np.int64]") -> "npt.NDArray[np.int64]":
-        bucket = np.zeros(delta.shape, dtype=np.int64)  # 0 = never
-        valid = delta >= 0
-        bucket[valid & (delta <= 1)] = 1
-        bucket[valid & (delta >= 2) & (delta <= 5)] = 2
-        bucket[valid & (delta >= 6) & (delta <= 10)] = 3
-        bucket[valid & (delta >= 11) & (delta <= 30)] = 4
-        bucket[valid & (delta >= 31) & (delta <= 80)] = 5
-        bucket[valid & (delta >= 81) & (delta <= 160)] = 6
-        bucket[valid & (delta > 160)] = 7
-        return bucket
-
-    def _append_target_timewise_stats(
-        self,
-        accum: Dict[str, Any],
-        cate_valid: "npt.NDArray[np.bool_]",
-        cate_match: "npt.NDArray[np.bool_]",
-        seq_timestamps: Optional["npt.NDArray[np.int64]"],
-    ) -> None:
-        """Append per-domain valid/match timestamps for one-pass finalization."""
-        if not self._target_hist_match_has_timewise or seq_timestamps is None:
-            return
-
-        start = int(accum['timewise_offset'])
-        end = start + seq_timestamps.shape[1]
-        valid_ts = np.where(cate_valid, seq_timestamps, 0)
-        accum['timewise_valid_ts'][:, start:end] = valid_ts
-        accum['timewise_match'][:, start:end] = cate_match & cate_valid
-        accum['timewise_offset'] = end
-
     def _accumulate_target_hist_match(
         self,
         *,
@@ -812,7 +618,7 @@ class PCVRParquetDataset(IterableDataset):
         current_timestamps: "npt.NDArray[np.int64]",
         target_cate_values: "npt.NDArray[np.int64]",
         seq_lengths: "npt.NDArray[np.int64]",
-        accum: Dict[str, Any],
+        accum: Dict[str, "npt.NDArray[np.int64]"],
     ) -> None:
         """Accumulate v1 target-history matching stats from one sequence domain."""
         B, _, L = seq_values.shape
@@ -826,10 +632,10 @@ class PCVRParquetDataset(IterableDataset):
             return
 
         hist_cate = seq_values[:, cate_slot, :]
-        cate_valid = base_valid & (hist_cate > DISCRETE_MISSING_ID)
+        cate_valid = base_valid & (hist_cate > 0)
         accum['hist_cate_len'] += cate_valid.sum(axis=1).astype(np.int64)
 
-        target_cate_valid = target_cate_values > DISCRETE_MISSING_ID
+        target_cate_valid = target_cate_values > 0
         if target_cate_values.shape[1] == 1:
             target_cate = target_cate_values[:, 0].reshape(B, 1)
             cate_match = (
@@ -852,62 +658,11 @@ class PCVRParquetDataset(IterableDataset):
                 accum['cate_last_delta'],
                 masked_delta.min(axis=1),
             )
-        self._append_target_timewise_stats(accum, cate_valid, cate_match, seq_timestamps)
-
-    def _build_target_timewise_features(
-        self,
-        accum: Dict[str, Any],
-    ) -> List["npt.NDArray[np.int64]"]:
-        """Build global target-cate timewise buckets from accumulated buffers."""
-        valid_ts = accum['timewise_valid_ts']
-        match = accum['timewise_match']
-        B, total_len = valid_ts.shape
-        has_valid = valid_ts > 0
-        has_match = match & has_valid
-
-        latest_match_ts = np.where(has_match, valid_ts, 0).max(axis=1)
-        position_delta = np.full(B, -1, dtype=np.int64)
-        matched = latest_match_ts > 0
-        if matched.any():
-            position_delta[matched] = (
-                valid_ts[matched] > latest_match_ts[matched, None]
-            ).sum(axis=1).astype(np.int64)
-
-        recent_k = min(int(self.target_hist_match_recent_k), total_len)
-        if recent_k <= 0:
-            recent_len = np.zeros(B, dtype=np.int64)
-            recent_count = np.zeros(B, dtype=np.int64)
-        else:
-            order = np.argpartition(-valid_ts, recent_k - 1, axis=1)[:, :recent_k]
-            recent_ts = np.take_along_axis(valid_ts, order, axis=1)
-            recent_match = np.take_along_axis(match, order, axis=1)
-            recent_valid = recent_ts > 0
-            recent_len = recent_valid.sum(axis=1).astype(np.int64)
-            recent_count = (recent_match & recent_valid).sum(axis=1).astype(np.int64)
-
-        recent_rate = np.zeros(B, dtype=np.float32)
-        long_rate = np.zeros(B, dtype=np.float32)
-        recent_nonzero = recent_len > 0
-        long_nonzero = accum['hist_cate_len'] > 0
-        recent_rate[recent_nonzero] = (
-            recent_count[recent_nonzero] / recent_len[recent_nonzero].astype(np.float32)
-        )
-        long_rate[long_nonzero] = (
-            accum['cate_match_count'][long_nonzero]
-            / accum['hist_cate_len'][long_nonzero].astype(np.float32)
-        )
-        trend = recent_rate - long_rate
-
-        return [
-            self._bucket_target_position_delta(position_delta),
-            self._bucket_target_recent_rate(recent_rate),
-            self._bucket_target_trend(trend, accum['hist_cate_len']),
-        ]
 
     def _write_target_hist_match_features(
         self,
         item_int: "npt.NDArray[np.int64]",
-        accum: Dict[str, Any],
+        accum: Dict[str, "npt.NDArray[np.int64]"],
     ) -> None:
         """Write v1 target-history matching buckets into appended item_int columns."""
         if not self.use_target_hist_match:
@@ -917,118 +672,13 @@ class PCVRParquetDataset(IterableDataset):
         last_delta = accum['cate_last_delta']
         last_delta = np.where(last_delta == np.iinfo(np.int64).max, -1, last_delta)
 
-        feat_parts = [
+        feats = np.stack([
             (cate_count > 0).astype(np.int64),
             self._bucket_target_cate_count(cate_count),
             self._bucket_target_cate_ratio(cate_count, accum['hist_cate_len']),
             self._bucket_target_last_delta(last_delta),
-        ]
-        if self._target_hist_match_has_timewise:
-            feat_parts.extend(self._build_target_timewise_features(accum))
-
-        feat_parts = self._encode_discrete_feature_parts(
-            feat_parts,
-            self._target_hist_match_vocab_sizes,
-            self.target_hist_match_feature_ids,
-            'target_hist_match',
-        )
-        feats = np.stack(feat_parts, axis=1)
-        end = self._target_hist_match_offset + self._target_hist_match_feature_count
-        item_int[:, self._target_hist_match_offset:end] = feats
-
-    def _write_recent_activity_features(
-        self,
-        *,
-        domain: str,
-        user_int: "npt.NDArray[np.int64]",
-        seq_timestamps: Optional["npt.NDArray[np.int64]"],
-        current_timestamps: "npt.NDArray[np.int64]",
-        seq_lengths: "npt.NDArray[np.int64]",
-    ) -> None:
-        """Write per-domain recent-activity buckets into appended user_int columns."""
-        if not self.use_recent_activity or seq_timestamps is None:
-            return
-
-        B, L = seq_timestamps.shape
-        positions = np.arange(L).reshape(1, L)
-        valid = (
-            (positions < seq_lengths.reshape(B, 1))
-            & (seq_timestamps > 0)
-            & (seq_timestamps < current_timestamps.reshape(B, 1))
-        )
-        delta = current_timestamps.reshape(B, 1) - seq_timestamps
-
-        masked_delta = np.where(valid, delta, np.iinfo(np.int64).max)
-        last_delta = masked_delta.min(axis=1)
-        last_delta = np.where(last_delta == np.iinfo(np.int64).max, -1, last_delta)
-
-        feats = [self._bucket_target_last_delta(last_delta)]
-        for window in self.recent_activity_windows_seconds:
-            count = (valid & (delta <= int(window))).sum(axis=1).astype(np.int64)
-            feats.append(self._bucket_target_cate_count(count))
-
-        start = self._recent_activity_domain_offset[domain]
-        end = start + self._recent_activity_features_per_group
-        domain_index = self.seq_domains.index(domain)
-        fid_start = domain_index * self._recent_activity_features_per_group
-        fid_end = fid_start + self._recent_activity_features_per_group
-        feats = self._encode_discrete_feature_parts(
-            feats,
-            self._recent_activity_vocab_sizes[fid_start:fid_end],
-            self.recent_activity_feature_ids[fid_start:fid_end],
-            'recent_activity',
-        )
-        user_int[:, start:end] = np.stack(feats, axis=1)
-
-    def _write_global_recent_activity_features(
-        self,
-        *,
-        user_int: "npt.NDArray[np.int64]",
-        seq_timestamps_list: List["npt.NDArray[np.int64]"],
-        seq_lengths_list: List["npt.NDArray[np.int64]"],
-        current_timestamps: "npt.NDArray[np.int64]",
-    ) -> None:
-        """Write global recent-activity buckets over all sequence domains."""
-        if not self.use_recent_activity or not seq_timestamps_list:
-            return
-
-        valid_parts = []
-        delta_parts = []
-        B = current_timestamps.shape[0]
-        current_ts = current_timestamps.reshape(B, 1)
-        for seq_timestamps, seq_lengths in zip(seq_timestamps_list, seq_lengths_list):
-            _, L = seq_timestamps.shape
-            positions = np.arange(L).reshape(1, L)
-            valid = (
-                (positions < seq_lengths.reshape(B, 1))
-                & (seq_timestamps > 0)
-                & (seq_timestamps < current_ts)
-            )
-            delta = current_ts - seq_timestamps
-            valid_parts.append(valid)
-            delta_parts.append(delta)
-
-        valid_all = np.concatenate(valid_parts, axis=1)
-        delta_all = np.concatenate(delta_parts, axis=1)
-
-        masked_delta = np.where(valid_all, delta_all, np.iinfo(np.int64).max)
-        last_delta = masked_delta.min(axis=1)
-        last_delta = np.where(last_delta == np.iinfo(np.int64).max, -1, last_delta)
-
-        feats = [self._bucket_target_last_delta(last_delta)]
-        for window in self.recent_activity_windows_seconds:
-            count = (valid_all & (delta_all <= int(window))).sum(axis=1).astype(np.int64)
-            feats.append(self._bucket_target_cate_count(count))
-
-        start = self._recent_activity_offset
-        end = start + self._recent_activity_features_per_group
-        feats = self._encode_discrete_feature_parts(
-            feats,
-            self._recent_activity_vocab_sizes,
-            self.recent_activity_feature_ids,
-            'recent_activity',
-        )
-        user_int[:, start:end] = np.stack(feats, axis=1)
+        ], axis=1)
+        item_int[:, self._target_hist_match_offset:self._target_hist_match_offset + 4] = feats
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
@@ -1043,23 +693,29 @@ class PCVRParquetDataset(IterableDataset):
             labels = np.zeros(B, dtype=np.int64)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
         # ---- user_int: write into pre-allocated buffer ----
-        # Note: 0 is structural padding, 1 is missing/null/-1/OOB, and raw
-        # values (including raw 0 buckets) are shifted by +2. Features with
-        # vs==0 have no vocab information and are forced to padding.
+        # Note: null -> 0 (via fill_null), -1 -> 0 (via arr<=0); missing values
+        # are treated the same as padding. Features with vs==0 have no vocab
+        # information and are forced to 0 on the dataset side so that the
+        # model's 1-slot Embedding (created for vs=0) is never indexed out of
+        # range.
         user_int = self._buf_user_int[:B]
         user_int[:] = 0
         for ci, dim, offset, vs in self._user_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
-                arr = self._encode_discrete_values(arr, vs, 'user_int', ci)
+                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+                arr[arr <= 0] = 0
+                if vs > 0:
+                    self._record_oob('user_int', ci, arr, vs)
+                else:
+                    arr[:] = 0
                 user_int[:, offset] = arr
             else:
-                padded, lengths = self._pad_varlen_int_column(col, dim, B)
-                padding_mask = np.arange(dim).reshape(1, dim) >= lengths.reshape(B, 1)
-                padded = self._encode_discrete_values(
-                    padded, vs, 'user_int', ci, padding_mask=padding_mask,
-                )
+                padded, _ = self._pad_varlen_int_column(col, dim, B)
+                if vs > 0:
+                    self._record_oob('user_int', ci, padded, vs)
+                else:
+                    padded[:] = 0
                 user_int[:, offset:offset + dim] = padded
 
         # ---- item_int ----
@@ -1068,15 +724,19 @@ class PCVRParquetDataset(IterableDataset):
         for ci, dim, offset, vs in self._item_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
-                arr = self._encode_discrete_values(arr, vs, 'item_int', ci)
+                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+                arr[arr <= 0] = 0
+                if vs > 0:
+                    self._record_oob('item_int', ci, arr, vs)
+                else:
+                    arr[:] = 0
                 item_int[:, offset] = arr
             else:
-                padded, lengths = self._pad_varlen_int_column(col, dim, B)
-                padding_mask = np.arange(dim).reshape(1, dim) >= lengths.reshape(B, 1)
-                padded = self._encode_discrete_values(
-                    padded, vs, 'item_int', ci, padding_mask=padding_mask,
-                )
+                padded, _ = self._pad_varlen_int_column(col, dim, B)
+                if vs > 0:
+                    self._record_oob('item_int', ci, padded, vs)
+                else:
+                    padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
 
         target_match_accum = None
@@ -1090,15 +750,6 @@ class PCVRParquetDataset(IterableDataset):
                 'hist_cate_len': np.zeros(B, dtype=np.int64),
                 'cate_last_delta': np.full(B, np.iinfo(np.int64).max, dtype=np.int64),
             }
-            if self._target_hist_match_has_timewise:
-                timewise_width = sum(self._seq_maxlen[domain] for domain in self.seq_domains)
-                target_match_accum['timewise_valid_ts'] = np.zeros(
-                    (B, timewise_width), dtype=np.int64
-                )
-                target_match_accum['timewise_match'] = np.zeros(
-                    (B, timewise_width), dtype=bool
-                )
-                target_match_accum['timewise_offset'] = 0
 
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
@@ -1120,8 +771,6 @@ class PCVRParquetDataset(IterableDataset):
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
-        recent_activity_ts_list: List["npt.NDArray[np.int64]"] = []
-        recent_activity_len_list: List["npt.NDArray[np.int64]"] = []
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
@@ -1137,14 +786,8 @@ class PCVRParquetDataset(IterableDataset):
             col_data = []
             for ci, slot, vs in side_plan:
                 col = batch.column(ci)
-                col_data.append((
-                    col.offsets.to_numpy(),
-                    col.values.fill_null(-1).to_numpy(zero_copy_only=False),
-                    vs,
-                    ci,
-                ))
+                col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
 
-            slot_lengths = np.zeros((len(col_data), B), dtype=np.int64)
             for c, (offs, vals, vs, ci) in enumerate(col_data):
                 for i in range(B):
                     s = int(offs[i])
@@ -1154,19 +797,21 @@ class PCVRParquetDataset(IterableDataset):
                         continue
                     ul = min(rl, max_len)
                     out[i, c, :ul] = vals[s:s + ul]
-                    slot_lengths[c, i] = ul
                     if ul > lengths[i]:
                         lengths[i] = ul
 
-            # Encode each side-info feature. vs==0 means no vocab info; force
-            # that slice to padding so the model is never indexed out of range.
-            positions = np.arange(max_len).reshape(1, max_len)
+            # Values <= 0 -> 0.
+            out[out <= 0] = 0
+
+            # Check out-of-bound values per feature's vocab_size.
+            # vs==0 means no vocab info; force the whole slice to 0 so that
+            # the model's 1-slot Embedding is never indexed out of range.
             for c, (_, _, vs, ci) in enumerate(col_data):
                 slice_c = out[:, c, :]
-                padding_mask = positions >= slot_lengths[c].reshape(B, 1)
-                slice_c[:] = self._encode_discrete_values(
-                    slice_c, vs, f'seq_{domain}', ci, padding_mask=padding_mask,
-                )
+                if vs > 0:
+                    self._record_oob(f'seq_{domain}', ci, slice_c, vs)
+                else:
+                    slice_c[:] = 0
 
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
@@ -1174,7 +819,6 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
-            ts_padded = None
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -1210,29 +854,6 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
-            if ts_padded is None:
-                result[f'{domain}_timestamp'] = torch.zeros(B, max_len, dtype=torch.long)
-            else:
-                result[f'{domain}_timestamp'] = torch.from_numpy(ts_padded.copy())
-
-            if (
-                self.use_recent_activity
-                and self.recent_activity_mode == 'per_domain'
-            ):
-                self._write_recent_activity_features(
-                    domain=domain,
-                    user_int=user_int,
-                    seq_timestamps=ts_padded,
-                    current_timestamps=timestamps,
-                    seq_lengths=lengths,
-                )
-            elif (
-                self.use_recent_activity
-                and self.recent_activity_mode == 'global'
-                and ts_padded is not None
-            ):
-                recent_activity_ts_list.append(ts_padded)
-                recent_activity_len_list.append(lengths.copy())
 
             if self.use_target_hist_match and target_match_accum is not None:
                 self._accumulate_target_hist_match(
@@ -1245,23 +866,9 @@ class PCVRParquetDataset(IterableDataset):
                     accum=target_match_accum,
                 )
 
-        if (
-            self.use_recent_activity
-            and self.recent_activity_mode == 'global'
-        ):
-            self._write_global_recent_activity_features(
-                user_int=user_int,
-                seq_timestamps_list=recent_activity_ts_list,
-                seq_lengths_list=recent_activity_len_list,
-                current_timestamps=timestamps,
-            )
-
         if self.use_target_hist_match and target_match_accum is not None:
             self._write_target_hist_match_features(item_int, target_match_accum)
             result['item_int_feats'] = torch.from_numpy(item_int.copy())
-
-        if self.use_recent_activity:
-            result['user_int_feats'] = torch.from_numpy(user_int.copy())
 
         return result
 
@@ -1279,7 +886,6 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     target_hist_match_config: Optional[Dict[str, Any]] = None,
-    recent_activity_config: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -1328,7 +934,6 @@ def get_pcvr_data(
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
         target_hist_match_config=target_hist_match_config,
-        recent_activity_config=recent_activity_config,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
         row_group_range=train_row_group_range,
@@ -1352,7 +957,6 @@ def get_pcvr_data(
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
         target_hist_match_config=target_hist_match_config,
-        recent_activity_config=recent_activity_config,
         shuffle=False,
         buffer_batches=0,
         row_group_range=valid_row_group_range,
