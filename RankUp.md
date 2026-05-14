@@ -31,35 +31,39 @@ cos(week_angle)
 
 
 
-#### --target_hist_timewise
+#### --target_hist_match
 
-###### 现在 `target-hist timewise` 这块是这样接的：
+###### `main` base 原版的 `target-hist` 是这样接的：
 
 ```text
 原始 item_int schema
-+ 追加 7 个 target_hist_match 动态 item_int 特征
-+ 这 7 个特征组成一个新增 item NS group
++ 追加 4 个 target_hist_match 动态 item_int 特征
++ 这 4 个特征组成一个新增 item NS group
 ```
 
-这 7 个 fid 默认是 [train.py](D:/code/project/TAAC/train.py:214) 里的：
+这 4 个 fid 默认是：
 
 ```text
-200001,200002,200003,200004,200005,200006,200007
+200001,200002,200003,200004
 ```
 
-对应语义在 [dataset.py](D:/code/project/TAAC/dataset.py:394)：
+对应语义是：
 
 ```text
-1. cate_in_hist
-2. cate_count_bucket
-3. cate_ratio_bucket
-4. cate_last_time_delta_bucket
-5. cate_last_position_delta_bucket
-6. cate_recent_ratio_bucket
-7. cate_recent_trend_bucket
+cate_in_hist:
+  target category 是否在历史 category 里出现过
+
+cate_count_bucket:
+  target category 在有效历史 category 中出现次数的分桶
+
+cate_ratio_bucket:
+  cate_count / hist_cate_len 的比例分桶
+
+cate_last_delta_bucket:
+  最近一次 target category 命中距离当前曝光时间有多久
 ```
 
-然后训练侧在 [train.py](D:/code/project/TAAC/train.py:446) 会把它们作为一个 `match_group` append 到 `item_ns_groups`：
+然后训练侧会把它们作为一个 `match_group` append 到 `item_ns_groups`：
 
 ```text
 Added I5_target_hist_match item NS group
@@ -100,24 +104,6 @@ Added I5_target_hist_match item NS group
   过去 1h 任意历史行为数
   过去 1d 任意历史行为数
   过去 7d 任意历史行为数
-```
-
-```text
-last_delta_bucket:
-0 = 无历史
-1 = <= 1h
-2 = 1h ~ 1d
-3 = 1d ~ 7d
-4 = 7d ~ 30d
-5 = > 30d
-
-count bucket:
-0 = 0
-1 = 1
-2 = 2
-3 = 3~5
-4 = 6~10
-5 = >10
 ```
 
 然后在 [train.py](D:/code/project/TAAC/train.py:419) 被追加到最后一个 user NS group 里，不单独新增一个 NS token
@@ -169,5 +155,67 @@ refined_time_emb ≈ time_bucket_emb
 
 ```text
 time_bucket_emb + 小幅周期修正
+```
+
+
+
+#### --trend_context_current
+
+这次的 `trend context` 是一个单独新增的 NS token。
+它不改旧的 `--time_context`、`--target_hist_match`、`--use_recent_activity` 说明；这里只记录当前 active config 里这次合并出来的 `trend_context_token`。
+
+当前 `run.sh` 打开的相关参数是：
+
+```bash
+--use_target_hist_match
+--target_hist_match_target_cate_item_fid 13
+--target_hist_match_cate_seq_fids seq_a:46,seq_b:68,seq_c:32,seq_d:25
+--target_hist_match_feature_fids 200001,200002,200003,200004,200005
+
+--use_recent_activity
+--recent_activity_mode global
+--recent_activity_feature_fids 210001,210002,210003
+--recent_activity_recent_window_seconds 604800
+--recent_activity_recent_k 64
+```
+
+它用到的原始信号是：
+
+```text
+target item category:
+  item_int fid 13
+
+history category:
+  seq_a fid 46
+  seq_b fid 68
+  seq_c fid 32
+  seq_d fid 25
+
+history validity / recency:
+  当前样本 timestamp
+  各 domain 历史 timestamp
+  各 domain seq_len
+```
+
+最终喂给 `trend_context_token` 的是 8 个 synthetic bucket 特征：
+
+```text
+200001: target_in_hist
+200002: target_count_bucket
+200003: target_ratio_bucket
+200004: target_last_position_delta_bucket
+200005: target_recent_trend_bucket
+
+210001: user_activity_level
+210002: user_activity_trend
+210003: user_activity_conf
+```
+
+组 token 的方式是：
+
+```text
+trend_context_token =
+Emb(210001,210002,210003) + Emb(200001,200002,200003,200004,200005)
+-> Linear + LayerNorm + SiLU
 ```
 
