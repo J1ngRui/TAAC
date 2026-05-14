@@ -133,7 +133,7 @@ class EarlyStopping:
         self,
         checkpoint_path: str,
         label: str = "",
-        patience: int = 5,
+        patience: int = 3,
         verbose: bool = False,
         delta: float = 0,
     ) -> None:

@@ -230,6 +230,7 @@ Epoch 1 Validation | AUC: 0.8602357429639006, LogLoss: 0.22603169083595276
 
 ```text
 Epoch 1 Validation | AUC: 0.8589506321191401, LogLoss: 0.22670724987983704
+Epoch 2 Validation | AUC: 0.8633029522261406, LogLoss: 0.22371038794517517
 ```
 
 ### main_trendc
