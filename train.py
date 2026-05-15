@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
                         help='Training device, e.g. cuda or cpu')
     parser.add_argument('--use_amp', action='store_true', default=False,
                         help='Enable CUDA automatic mixed precision for faster training')
-    parser.add_argument('--amp_dtype', type=str, default='fp16',
+    parser.add_argument('--amp_dtype', type=str, default='bf16',
                         choices=['fp16', 'bf16'],
                         help='AMP compute dtype when --use_amp is enabled')
 

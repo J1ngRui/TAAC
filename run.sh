@@ -18,7 +18,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_workers 8 \
     --patience 3 \
     --use_amp \
-    --amp_dtype fp16 \
+    --amp_dtype bf16 \
     --loss_type bce \
     --dropout_rate 0.05 \
     --token_dropout_rate 0.08 \
