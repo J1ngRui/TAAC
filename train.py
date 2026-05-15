@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=5,
+    parser.add_argument('--patience', type=int, default=3,
                         help='Early-stopping patience '
                              '(number of validations without improvement)')
     parser.add_argument('--seed', type=int, default=42,
@@ -114,6 +114,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--use_amp', action='store_true', default=False,
+                        help='Enable CUDA automatic mixed precision for faster training')
+    parser.add_argument('--amp_dtype', type=str, default='fp16',
+                        choices=['fp16', 'bf16'],
+                        help='AMP compute dtype when --use_amp is enabled')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -155,6 +160,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dropout_rate', type=float, default=0.01,
                         help='Dropout rate for the backbone '
                              '(seq id-embedding dropout is twice this value)')
+    parser.add_argument('--token_dropout_rate', type=float, default=0.0,
+                        help='Training-only whole-token dropout rate for Q/NS/sequence tokens')
     parser.add_argument('--seq_top_k', type=int, default=50,
                         help='Number of most-recent tokens kept by LongerEncoder '
                              '(only effective when --seq_encoder_type=longer)')
@@ -214,6 +221,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--rdrop_alpha', type=float, default=0.0,
+                        help='R-Drop consistency regularization weight '
+                             '(0 disables the second stochastic forward pass)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -390,6 +400,7 @@ def main() -> None:
         "seq_encoder_type": args.seq_encoder_type,
         "hidden_mult": args.hidden_mult,
         "dropout_rate": args.dropout_rate,
+        "token_dropout_rate": args.token_dropout_rate,
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
@@ -453,6 +464,9 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        use_amp=args.use_amp,
+        amp_dtype=args.amp_dtype,
+        rdrop_alpha=args.rdrop_alpha,
     )
 
     trainer.train()

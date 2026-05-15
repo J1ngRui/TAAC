@@ -1013,6 +1013,7 @@ class GroupNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
+
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
         real_idx = 0
@@ -1292,6 +1293,7 @@ class PCVRHyFormer(nn.Module):
         seq_encoder_type: str = 'transformer',
         hidden_mult: int = 4,
         dropout_rate: float = 0.01,
+        token_dropout_rate: float = 0.0,
         seq_top_k: int = 50,
         seq_causal: bool = False,
         action_num: int = 1,
@@ -1324,6 +1326,7 @@ class PCVRHyFormer(nn.Module):
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.token_dropout_rate = min(0.95, max(0.0, float(token_dropout_rate)))
 
         # ================== NS Tokens Construction ==================
 
@@ -1744,6 +1747,23 @@ class PCVRHyFormer(nn.Module):
 
         return torch.cat(ns_parts, dim=1)
 
+    def _drop_whole_tokens(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Drop full token vectors during training to reduce shortcut reliance."""
+        if not self.training or self.token_dropout_rate <= 0.0:
+            return tokens
+        if tokens.numel() == 0:
+            return tokens
+        keep_prob = 1.0 - self.token_dropout_rate
+        keep = torch.rand(tokens.shape[:2], device=tokens.device) < keep_prob
+        if padding_mask is not None:
+            keep = keep | padding_mask
+        keep = keep.unsqueeze(-1).to(dtype=tokens.dtype)
+        return tokens * keep / keep_prob
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1754,9 +1774,15 @@ class PCVRHyFormer(nn.Module):
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
         if apply_dropout:
-            q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
-            ns_tokens = self.emb_dropout(ns_tokens)
-            seq_tokens_list = [self.emb_dropout(s) for s in seq_tokens_list]
+            q_tokens_list = [
+                self._drop_whole_tokens(self.emb_dropout(q))
+                for q in q_tokens_list
+            ]
+            ns_tokens = self._drop_whole_tokens(self.emb_dropout(ns_tokens))
+            seq_tokens_list = [
+                self._drop_whole_tokens(self.emb_dropout(s), mask)
+                for s, mask in zip(seq_tokens_list, seq_masks_list)
+            ]
 
         curr_qs = q_tokens_list
         curr_ns = ns_tokens

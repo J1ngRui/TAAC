@@ -56,6 +56,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_encoder_type': 'transformer',
     'hidden_mult': 4,
     'dropout_rate': 0.01,
+    'token_dropout_rate': 0.0,
     'seq_top_k': 50,
     'seq_causal': False,
     'action_num': 1,

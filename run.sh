@@ -2,7 +2,7 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: group + time context v1 + target-cate history match + BCE ----
+# ---- Active config: main_gapReg = main_base + AMP + strong generalization regularizers ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type group \
     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
@@ -16,6 +16,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --rank_mixer_mode full \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
+    --patience 3 \
+    --use_amp \
+    --amp_dtype fp16 \
     --loss_type bce \
-    --dropout_rate 0.01 \
+    --dropout_rate 0.05 \
+    --token_dropout_rate 0.08 \
+    --rdrop_alpha 0.5 \
     "$@"
