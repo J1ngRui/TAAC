@@ -1013,7 +1013,6 @@ class GroupNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
-
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
         real_idx = 0
@@ -1293,7 +1292,6 @@ class PCVRHyFormer(nn.Module):
         seq_encoder_type: str = 'transformer',
         hidden_mult: int = 4,
         dropout_rate: float = 0.01,
-        token_dropout_rate: float = 0.0,
         seq_top_k: int = 50,
         seq_causal: bool = False,
         action_num: int = 1,
@@ -1326,7 +1324,6 @@ class PCVRHyFormer(nn.Module):
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
-        self.token_dropout_rate = min(0.95, max(0.0, float(token_dropout_rate)))
 
         # ================== NS Tokens Construction ==================
 
@@ -1421,11 +1418,9 @@ class PCVRHyFormer(nn.Module):
             )
 
         if self.use_time_context:
-            cyclic_dim = 4
             self.time_context_proj = nn.Sequential(
-                nn.Linear(cyclic_dim, d_model),
+                nn.Linear(4, d_model),
                 nn.LayerNorm(d_model),
-                nn.GELU()
             )
 
         # Total NS token count
@@ -1702,7 +1697,7 @@ class PCVRHyFormer(nn.Module):
     def _build_time_context_features(self, timestamp: torch.Tensor) -> torch.Tensor:
         """Build cyclic current-time features from Unix-second timestamps.
 
-        Features are sin/cos for local second-of-day and day-of-week.
+        Features are sin/cos for local second-of-day and local day-of-week.
         ``time_context_tz_offset_hours`` shifts Unix UTC seconds to the desired
         business timezone before extracting the cycles.
         """
@@ -1723,11 +1718,6 @@ class PCVRHyFormer(nn.Module):
             torch.cos(week_angle),
         ], dim=-1)
 
-    def _build_time_context_token(self, timestamp: torch.Tensor) -> torch.Tensor:
-        """Build the time context token from cyclic timestamp features."""
-        cyclic_feats = self._build_time_context_features(timestamp)
-        return self.time_context_proj(cyclic_feats)
-
     def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
         """Build all non-sequence tokens, including optional time context."""
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
@@ -1742,27 +1732,11 @@ class PCVRHyFormer(nn.Module):
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
         if self.use_time_context:
-            time_context_tok = self._build_time_context_token(inputs.timestamp).unsqueeze(1)
+            time_feats = self._build_time_context_features(inputs.timestamp)
+            time_context_tok = F.gelu(self.time_context_proj(time_feats)).unsqueeze(1)
             ns_parts.append(time_context_tok)
 
         return torch.cat(ns_parts, dim=1)
-
-    def _drop_whole_tokens(
-        self,
-        tokens: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Drop full token vectors during training to reduce shortcut reliance."""
-        if not self.training or self.token_dropout_rate <= 0.0:
-            return tokens
-        if tokens.numel() == 0:
-            return tokens
-        keep_prob = 1.0 - self.token_dropout_rate
-        keep = torch.rand(tokens.shape[:2], device=tokens.device) < keep_prob
-        if padding_mask is not None:
-            keep = keep | padding_mask
-        keep = keep.unsqueeze(-1).to(dtype=tokens.dtype)
-        return tokens * keep / keep_prob
 
     def _run_multi_seq_blocks(
         self,
@@ -1774,15 +1748,9 @@ class PCVRHyFormer(nn.Module):
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
         if apply_dropout:
-            q_tokens_list = [
-                self._drop_whole_tokens(self.emb_dropout(q))
-                for q in q_tokens_list
-            ]
-            ns_tokens = self._drop_whole_tokens(self.emb_dropout(ns_tokens))
-            seq_tokens_list = [
-                self._drop_whole_tokens(self.emb_dropout(s), mask)
-                for s, mask in zip(seq_tokens_list, seq_masks_list)
-            ]
+            q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
+            ns_tokens = self.emb_dropout(ns_tokens)
+            seq_tokens_list = [self.emb_dropout(s) for s in seq_tokens_list]
 
         curr_qs = q_tokens_list
         curr_ns = ns_tokens

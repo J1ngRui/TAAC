@@ -14,16 +14,12 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import (
-    FeatureSchema,
-    get_pcvr_data,
-    NUM_TIME_BUCKETS,
-)
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -40,49 +36,6 @@ def build_feature_specs(
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
     return specs
-
-
-def parse_int_list(value: str) -> List[int]:
-    """Parse a comma-separated integer list."""
-    return [int(x.strip()) for x in value.split(',') if x.strip()]
-
-
-def parse_domain_fid_map(value: str) -> Dict[str, int]:
-    """Parse ``seq_a:46,seq_b:68`` into a domain->fid mapping."""
-    result: Dict[str, int] = {}
-    for pair in value.split(','):
-        if not pair.strip():
-            continue
-        domain, fid = pair.split(':')
-        result[domain.strip()] = int(fid.strip())
-    return result
-
-
-def build_target_hist_match_config(args: argparse.Namespace) -> Dict[str, object]:
-    """Build optional target-history matching config for the dataset."""
-    if not args.use_target_hist_match:
-        return {"enabled": False}
-
-    required = {
-        "target_hist_match_target_cate_item_fid": args.target_hist_match_target_cate_item_fid,
-        "target_hist_match_cate_seq_fids": args.target_hist_match_cate_seq_fids,
-    }
-    missing = [name for name, value in required.items() if value is None]
-    if missing:
-        raise ValueError(
-            "--use_target_hist_match requires: " + ", ".join(f"--{name}" for name in missing)
-        )
-
-    feature_fids = parse_int_list(args.target_hist_match_feature_fids)
-    if len(feature_fids) != 4:
-        raise ValueError("--target_hist_match_feature_fids must contain exactly 4 fids")
-
-    return {
-        "enabled": True,
-        "target_cate_item_fid": args.target_hist_match_target_cate_item_fid,
-        "hist_cate_seq_fids": parse_domain_fid_map(args.target_hist_match_cate_seq_fids),
-        "feature_fids": feature_fids,
-    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=3,
+    parser.add_argument('--patience', type=int, default=5,
                         help='Early-stopping patience '
                              '(number of validations without improvement)')
     parser.add_argument('--seed', type=int, default=42,
@@ -114,11 +67,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
-    parser.add_argument('--use_amp', action='store_true', default=False,
-                        help='Enable CUDA automatic mixed precision for faster training')
-    parser.add_argument('--amp_dtype', type=str, default='bf16',
-                        choices=['fp16', 'bf16'],
-                        help='AMP compute dtype when --use_amp is enabled')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -160,8 +108,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dropout_rate', type=float, default=0.01,
                         help='Dropout rate for the backbone '
                              '(seq id-embedding dropout is twice this value)')
-    parser.add_argument('--token_dropout_rate', type=float, default=0.0,
-                        help='Training-only whole-token dropout rate for Q/NS/sequence tokens')
     parser.add_argument('--seq_top_k', type=int, default=50,
                         help='Number of most-recent tokens kept by LongerEncoder '
                              '(only effective when --seq_encoder_type=longer)')
@@ -182,21 +128,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
                         help='Timezone offset used for timestamp cyclic features '
                              '(default: 8.0 for UTC+8)')
-    parser.add_argument('--use_target_hist_match', action='store_true', default=False,
-                        help='Append target-category/history-category matching bucket features '
-                             'as a dedicated item NS group')
-    parser.add_argument('--target_hist_match_target_cate_item_fid', type=int, default=None,
-                        help='Item-int fid containing target category ids '
-                             '(required by --use_target_hist_match)')
-    parser.add_argument('--target_hist_match_cate_seq_fids', type=str, default=None,
-                        help='Per-domain historical category fid mapping, e.g. '
-                             'seq_a:46,seq_b:68,seq_c:32,seq_d:25 '
-                             '(required by --use_target_hist_match)')
-    parser.add_argument('--target_hist_match_feature_fids', type=str,
-                        default='200001,200002,200003,200004',
-                        help='Synthetic item-int fids for target category matching '
-                             'features: cate_in_hist,cate_count_bucket,'
-                             'cate_ratio_bucket,cate_last_delta_bucket')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -209,11 +140,7 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce',
-                        choices=[
-                            'bce',
-                            'focal',
-                        ],
+    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
@@ -221,9 +148,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
-    parser.add_argument('--rdrop_alpha', type=float, default=0.0,
-                        help='R-Drop consistency regularization weight '
-                             '(0 disables the second stochastic forward pass)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -321,10 +245,6 @@ def main() -> None:
             seq_max_lens[k.strip()] = int(v.strip())
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
-    target_hist_match_config = build_target_hist_match_config(args)
-    if target_hist_match_config.get("enabled", False):
-        logging.info(f"TargetHistMatchV1 enabled: {target_hist_match_config}")
-
     logging.info("Using Parquet data format (IterableDataset)")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
@@ -336,7 +256,6 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
-        target_hist_match_config=target_hist_match_config,
     )
 
     # ---- NS groups ----
@@ -353,30 +272,7 @@ def main() -> None:
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
         user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
-        target_match_fids = set(
-            target_hist_match_config.get("feature_fids", [])
-            if target_hist_match_config.get("enabled", False)
-            else []
-        )
-        item_ns_groups = [
-            [i]
-            for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)
-            if fid not in target_match_fids
-        ]
-
-    if target_hist_match_config.get("enabled", False):
-        item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
-        match_group = [
-            item_fid_to_idx[fid]
-            for fid in target_hist_match_config["feature_fids"]  # type: ignore[index]
-        ]
-        if match_group not in item_ns_groups:
-            item_ns_groups.append(match_group)
-        logging.info(
-            "Added I5_target_hist_match item NS group with fids=%s, indices=%s",
-            target_hist_match_config["feature_fids"],
-            match_group,
-        )
+        item_ns_groups = [[i] for i in range(len(pcvr_dataset.item_int_schema.entries))]
 
     # ---- Build model ----
     user_int_feature_specs = build_feature_specs(
@@ -400,7 +296,6 @@ def main() -> None:
         "seq_encoder_type": args.seq_encoder_type,
         "hidden_mult": args.hidden_mult,
         "dropout_rate": args.dropout_rate,
-        "token_dropout_rate": args.token_dropout_rate,
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
@@ -464,9 +359,6 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
-        use_amp=args.use_amp,
-        amp_dtype=args.amp_dtype,
-        rdrop_alpha=args.rdrop_alpha,
     )
 
     trainer.train()
