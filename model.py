@@ -1419,9 +1419,10 @@ class PCVRHyFormer(nn.Module):
 
         if self.use_time_context:
             self.time_context_proj = nn.Sequential(
-                nn.Linear(4, d_model),
+                nn.Linear(6, d_model),
                 nn.LayerNorm(d_model),
             )
+            self.time_context_dropout = nn.Dropout(0.02)
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
@@ -1697,23 +1698,31 @@ class PCVRHyFormer(nn.Module):
     def _build_time_context_features(self, timestamp: torch.Tensor) -> torch.Tensor:
         """Build cyclic current-time features from Unix-second timestamps.
 
-        Features are sin/cos for local second-of-day and local day-of-week.
+        Features are sin/cos for local minute-of-hour, hour-of-day, and
+        day-of-week.
         ``time_context_tz_offset_hours`` shifts Unix UTC seconds to the desired
         business timezone before extracting the cycles.
         """
         ts = timestamp.to(dtype=torch.float32)
         local_ts = ts + float(self.time_context_tz_offset_hours) * 3600.0
         seconds_per_day = 86400.0
+        seconds_per_hour = 3600.0
         seconds_of_day = torch.remainder(local_ts, seconds_per_day)
+        seconds_of_hour = torch.remainder(local_ts, seconds_per_hour)
+        hour_of_day = torch.floor(seconds_of_day / seconds_per_hour)
+        minute_of_hour = torch.floor(seconds_of_hour / 60.0)
         day_index = torch.floor(local_ts / seconds_per_day)
         day_of_week = torch.remainder(day_index + 3.0, 7.0)
 
         two_pi = 2.0 * math.pi
-        day_angle = seconds_of_day / seconds_per_day * two_pi
+        minute_angle = minute_of_hour / 60.0 * two_pi
+        hour_angle = hour_of_day / 24.0 * two_pi
         week_angle = day_of_week / 7.0 * two_pi
         return torch.stack([
-            torch.sin(day_angle),
-            torch.cos(day_angle),
+            torch.sin(minute_angle),
+            torch.cos(minute_angle),
+            torch.sin(hour_angle),
+            torch.cos(hour_angle),
             torch.sin(week_angle),
             torch.cos(week_angle),
         ], dim=-1)
@@ -1734,6 +1743,7 @@ class PCVRHyFormer(nn.Module):
         if self.use_time_context:
             time_feats = self._build_time_context_features(inputs.timestamp)
             time_context_tok = F.gelu(self.time_context_proj(time_feats)).unsqueeze(1)
+            time_context_tok = self.time_context_dropout(time_context_tok)
             ns_parts.append(time_context_tok)
 
         return torch.cat(ns_parts, dim=1)
