@@ -105,34 +105,6 @@ def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
     return seq_max_lens
 
 
-def _parse_int_list(value: str) -> List[int]:
-    return [int(x.strip()) for x in value.split(',') if x.strip()]
-
-
-def _parse_domain_fid_map(value: str) -> Dict[str, int]:
-    result: Dict[str, int] = {}
-    for pair in value.split(','):
-        if not pair.strip():
-            continue
-        domain, fid = pair.split(':')
-        result[domain.strip()] = int(fid.strip())
-    return result
-
-
-def build_target_hist_match_config(train_config: Dict[str, Any]) -> Dict[str, Any]:
-    if not train_config.get('use_target_hist_match', False):
-        return {'enabled': False}
-    feature_fids = _parse_int_list(
-        train_config.get('target_hist_match_feature_fids', '200001,200002,200003,200004')
-    )
-    return {
-        'enabled': True,
-        'target_cate_item_fid': train_config['target_hist_match_target_cate_item_fid'],
-        'hist_cate_seq_fids': _parse_domain_fid_map(train_config['target_hist_match_cate_seq_fids']),
-        'feature_fids': feature_fids,
-    }
-
-
 def load_train_config(model_dir: str) -> Dict[str, Any]:
     """Load ``train_config.json`` from the ckpt directory.
 
@@ -242,28 +214,7 @@ def build_model(
     else:
         logging.info("No NS groups JSON found, using default: each feature as one group")
         user_ns_groups = [[i] for i in range(len(dataset.user_int_schema.entries))]
-        target_match_fids = set(dataset.target_hist_match_feature_ids)
-        item_ns_groups = [
-            [i]
-            for i, (fid, _, _) in enumerate(dataset.item_int_schema.entries)
-            if fid not in target_match_fids
-        ]
-
-    if getattr(dataset, 'use_target_hist_match', False):
-        item_fid_to_idx = {
-            fid: i for i, (fid, _, _) in enumerate(dataset.item_int_schema.entries)
-        }
-        match_group = [
-            item_fid_to_idx[fid]
-            for fid in dataset.target_hist_match_feature_ids
-        ]
-        if match_group not in item_ns_groups:
-            item_ns_groups.append(match_group)
-        logging.info(
-            "Added I5_target_hist_match item NS group with fids=%s, indices=%s",
-            dataset.target_hist_match_feature_ids,
-            match_group,
-        )
+        item_ns_groups = [[i] for i in range(len(dataset.item_int_schema.entries))]
 
     # Feature specs.
     user_int_feature_specs = build_feature_specs(
@@ -380,10 +331,6 @@ def main() -> None:
     seq_max_lens = _parse_seq_max_lens(sml_str)
     logging.info(f"seq_max_lens: {seq_max_lens}")
 
-    target_hist_match_config = build_target_hist_match_config(train_config)
-    if target_hist_match_config.get('enabled', False):
-        logging.info(f"TargetHistMatchV1 enabled: {target_hist_match_config}")
-
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
@@ -393,7 +340,6 @@ def main() -> None:
         schema_path=schema_path,
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
-        target_hist_match_config=target_hist_match_config,
         shuffle=False,
         buffer_batches=0,
         is_training=False,
