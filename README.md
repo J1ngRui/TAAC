@@ -77,7 +77,10 @@ domain sequence 表征
 2. `time context v1` 的 clean 口径保留 day 内周期与 week 周期，不再包含 month 周期特征。
 3. `domain_time_buckets` / `time_context_dropout` 属于结构容量改动，缺少强 test 收益证明，已从主线回退。
 4. WLoss 相关训练入口和实现已删除，后续 A/B 不再混入 loss reweight 变量。
-5. 当前 A/B 重点是以 `main_base` 为 anchor，单独验证 `+act` / `+global_target_timewise` 的独立和边际收益。
+5. `main_gact` / `main_ref` / `main_miss` 的共同现象是 valid AUC 或 LogLoss 继续变好，但 Test AUC 全部低于 `main_base`；不能再按 valid 单点提升推进主线。
+6. 当前 token 数是 `T=22`，来自 `2*4` 个 Q token 加 `14` 个 NS token；旧 full RankMixer 为了满足 `d_model % T == 0` 使用 `d_model=88`。
+7. 因为当前使用的是 `ns_tokenizer_type=group`，风险点不是 `RankMixerNSTokenizer` 的长向量切块，而是旧 `RankMixerBlock(mode=full)` 的无参数 token mixing 会把新增 NS token 的通道切片重排进所有 Q/NS token。
+8. 主线改为 UniMixer-lite 风格的 `rank_mixer_mode=learned`，用可学习 soft token mixing 替代固定切片重排，并把 `d_model` 回归 64；mixer 后使用 shared SwiGLU FFN，只有 legacy `full` 模式仍要求 `d_model % T == 0`。
 
 <details>
 <summary>逐 epoch 原始记录</summary>
@@ -107,97 +110,7 @@ Epoch 6 Validation | AUC: 0.865100, LogLoss: 0.222718
 Test AUC: 0.820503
 ```
 
-### time context v1 + anchor_time
-
-```text
-Epoch 1 Validation | AUC: 0.859736, LogLoss: 0.226455
-Epoch 2 Validation | AUC: 0.862898, LogLoss: 0.223629
-Epoch 3 Validation | AUC: 0.863885, LogLoss: 0.223102
-Epoch 4 Validation | AUC: 0.864269, LogLoss: 0.222635
-Epoch 5 Validation | AUC: 0.864272, LogLoss: 0.222971
-Epoch 6 Validation | AUC: 0.863825, LogLoss: 0.223036
-Test AUC: 未测试
-```
-
-### time context v1 + anchor_time + WLoss
-
-```text
-Epoch 1 Validation | AUC: 0.859736, LogLoss: 0.226455
-Epoch 2 Validation | AUC: 0.862898, LogLoss: 0.223629
-Epoch 3 Validation | AUC: 0.863856, LogLoss: 0.223685
-Epoch 4 Validation | AUC: 0.864433, LogLoss: 0.222764
-Epoch 5 Validation | AUC: 0.864027, LogLoss: 0.223762
-Test AUC: 0.817130
-```
-
-### time context v2 + WLoss
-
-```text
-Epoch 1 Validation | AUC: 0.860049, LogLoss: 0.226179
-Epoch 2 Validation | AUC: 0.863377, LogLoss: 0.223471
-Epoch 3 Validation | AUC: 0.864380, LogLoss: 0.222985
-Epoch 4 Validation | AUC: 0.864342, LogLoss: 0.222643
-Epoch 5 Validation | AUC: 0.864359, LogLoss: 0.222981
-Epoch 6 Validation | AUC: 0.864621, LogLoss: 0.222876
-Epoch 7 Validation | AUC: 0.863733, LogLoss: 0.223559
-Test AUC: 0.817673
-```
-
-### time context v2 + WLoss + target_cate_hist
-
-```text
-Epoch 1 Validation | AUC: 0.859629, LogLoss: 0.226133
-Epoch 2 Validation | AUC: 0.863386, LogLoss: 0.223394
-Epoch 3 Validation | AUC: 0.863715, LogLoss: 0.223392
-Epoch 4 Validation | AUC: 0.863032, LogLoss: 0.223757
-Epoch 5 Validation | AUC: 0.863951, LogLoss: 0.223181
-Epoch 6 Validation | AUC: 0.863165, LogLoss: 0.225804
-Test AUC: 0.820517
-```
-
-### time context v2
-
-```text
-Epoch 1 Validation | AUC: 0.860049, LogLoss: 0.226179
-Epoch 2 Validation | AUC: 0.863377, LogLoss: 0.223471
-Epoch 3 Validation | AUC: 0.864367, LogLoss: 0.222941
-Epoch 4 Validation | AUC: 0.864267, LogLoss: 0.222647
-Epoch 5 Validation | AUC: 0.864346, LogLoss: 0.222892
-Test AUC: 0.820265
-```
-
-### time context v2 + target_cate_hist
-
-```text
-Epoch 1 Validation | AUC: 0.859629, LogLoss: 0.226133
-Epoch 2 Validation | AUC: 0.863386, LogLoss: 0.223394
-Epoch 3 Validation | AUC: 0.863712, LogLoss: 0.223384
-Epoch 4 Validation | AUC: 0.863016, LogLoss: 0.223749
-Epoch 5 Validation | AUC: 0.863920, LogLoss: 0.223018
-Epoch 6 Validation | AUC: 0.863553, LogLoss: 0.225041
-Test AUC: 未测试，因为v2不如v1
-```
-
-</details>
-
-<details>
-<summary>Main epoch 记录</summary>
-
-### main_prev （time context v1）
-
-
-```
-Epoch 1 Validation | AUC: 0.8589916953859507, LogLoss: 0.22725152969360352
-Epoch 2 Validation | AUC: 0.8634527978728386, LogLoss: 0.22394008934497833
-Epoch 3 Validation | AUC: 0.8643401958003973, LogLoss: 0.22323431074619293
-Epoch 4 Validation | AUC: 0.864563507016832, LogLoss: 0.22325144708156586
-Epoch 5 Validation | AUC: 0.8655272198441499, LogLoss: 0.22246094048023224
-Epoch 6 Validation | AUC: 0.8651004818893825, LogLoss: 0.22271838784217834
-Test AUC：0.8212
-```
-
-### main_base （time context v1 + target_cate_hist）
-
+### time context v1 + target_cate_hist（main）
 
 ```text
 Epoch 1 Validation | AUC: 0.858521, LogLoss: 0.227749
@@ -227,6 +140,7 @@ Epoch 1 Validation | AUC: 0.8602357429639006, LogLoss: 0.22603169083595276
 Epoch 2 Validation | AUC: 0.8643096070531222, LogLoss: 0.22333790361881256
 Epoch 3 Validation | AUC: 0.8656528005616155, LogLoss: 0.22246608138084412
 Epoch 4 Validation | AUC: 0.8651367361649579, LogLoss: 0.22213102877140045
+Test AUC：0.820324
 ```
 
 ### main_miss
@@ -240,10 +154,67 @@ Epoch 5 Validation | AUC: 0.8645241416161386, LogLoss: 0.22299005091190338
 Test AUC: 0.820701
 ```
 
-### main_trendc
-
-```text
+### main_timeV15
 
 ```
+Epoch 1 Validation | AUC: 0.8587096057391499, LogLoss: 0.22766029834747314
+Epoch 2 Validation | AUC: 0.8625916652714761, LogLoss: 0.223570838570594
+Epoch 3 Validation | AUC: 0.8632375230054341, LogLoss: 0.22510819137096405
+Epoch 4 Validation | AUC: 0.8634255060057077, LogLoss: 0.2238648384809494
+Epoch 5 Validation | AUC: 0.8644639678505021, LogLoss: 0.22247228026390076
+```
+
+### main_userPair_v1
+
+```
+Epoch 1 Validation | AUC: 0.8587585587062858, LogLoss: 0.22734025120735168
+Epoch 2 Validation | AUC: 0.8611411895450327, LogLoss: 0.22540171444416046
+Epoch 3 Validation | AUC: 0.8636768982765632, LogLoss: 0.22318686544895172
+Epoch 4 Validation | AUC: 0.8638127107284859, LogLoss: 0.22348766028881073
+Epoch 5 Validation | AUC: 0.8643185857558675, LogLoss: 0.2228502333164215
+```
+
+### main_userPair_v2
+
+```
+Epoch 1 Validation | AUC: 0.8599211103400455, LogLoss: 0.22627413272857666
+Epoch 2 Validation | AUC: 0.8625859812763018, LogLoss: 0.2242143452167511
+Epoch 3 Validation | AUC: 0.8636834708542607, LogLoss: 0.22450315952301025
+
+```
+
+### main_twc
+
+```
+Epoch 1 Validation | AUC: 0.8603345820184504, LogLoss: 0.22630852460861206
+Epoch 2 Validation | AUC: 0.8631763531148908, LogLoss: 0.2242639660835266
+Epoch 3 Validation | AUC: 0.8643155452393851, LogLoss: 0.22268152236938477
+Epoch 4 Validation | AUC: 0.8643509163638711, LogLoss: 0.22328625619411469
+Test AUC：早早拟合，感觉不对
+```
+
+### main_gapGag
+
+```
+Epoch 1 Validation | AUC: 0.8576212415126411, LogLoss: 0.2272794097661972
+Epoch 2 Validation | AUC: 0.8611784372297984, LogLoss: 0.22493386268615723
+Epoch 3 Validation | AUC: 0.863180056266262, LogLoss: 0.2235773205757141
+Epoch 4 Validation | AUC: 0.8632286746570932, LogLoss: 0.2235700488090515
+Epoch 5 Validation | AUC: 0.8633181178748037, LogLoss: 0.22385279834270477
+Epoch 6 Validation | AUC: 0.8638972759757558, LogLoss: 0.22319595515727997
+Epoch 7 Validation | AUC: 0.8639215734935893, LogLoss: 0.22353345155715942
+```
+
+对以下移除了tar-hist的得分点
+
+tc_userPair
+
+tc_timeV15
+
+tc_miss
+
+tc_gapGeg
+
+tc_userPair_timeV15
 
 </details>
