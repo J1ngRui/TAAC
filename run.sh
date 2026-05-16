@@ -9,7 +9,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --use_time_context \
     --time_context_tz_offset_hours 8 \
-    --d_model 84 \
+    --d_model 88 \
     --rank_mixer_mode full \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
