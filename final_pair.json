@@ -1,6 +1,10 @@
 {
   "user_pairs": [
     {
+      "int_fid": 62,
+      "dense_fid": 62
+    },
+    {
       "int_fid": 63,
       "dense_fid": 63
     },

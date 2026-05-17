@@ -11,6 +11,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --time_context_tz_offset_hours 8 \
     --d_model 84 \
     --rank_mixer_mode full \
+    --use_final_pair \
+    --final_pair_json "${SCRIPT_DIR}/final_pair.json" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --loss_type bce \
