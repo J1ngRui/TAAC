@@ -38,6 +38,64 @@ def build_feature_specs(
     return specs
 
 
+def _load_final_pair_config(path: str) -> Dict[str, Any]:
+    if not path:
+        return {'user_pairs': [], 'item_pairs': []}
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"final_pair_json not found: {path}")
+    with open(path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+    cfg.setdefault('user_pairs', [])
+    cfg.setdefault('item_pairs', [])
+    return cfg
+
+
+def _resolve_pair_mapping(
+    pairs: List[Dict[str, int]],
+    int_schema: FeatureSchema,
+    dense_schema: FeatureSchema,
+    side_name: str,
+) -> List[Tuple[int, int]]:
+    int_fid_to_idx = {
+        fid: idx for idx, (fid, _, _) in enumerate(int_schema.entries)
+    }
+    dense_fid_to_idx = {
+        fid: idx for idx, (fid, _, _) in enumerate(dense_schema.entries)
+    }
+    mapping: List[Tuple[int, int]] = []
+    for pair in pairs:
+        int_fid = int(pair['int_fid'])
+        dense_fid = int(pair['dense_fid'])
+        if int_fid not in int_fid_to_idx:
+            raise ValueError(
+                f"final_pair {side_name}: int_fid={int_fid} not found in schema")
+        if dense_fid not in dense_fid_to_idx:
+            raise ValueError(
+                f"final_pair {side_name}: dense_fid={dense_fid} not found in schema")
+        mapping.append((int_fid_to_idx[int_fid], dense_fid_to_idx[dense_fid]))
+    return mapping
+
+
+def build_final_pair_mappings(
+    cfg: Dict[str, Any],
+    pcvr_dataset: Any,
+) -> Dict[str, List[Tuple[int, int]]]:
+    return {
+        'user_pairs': _resolve_pair_mapping(
+            cfg.get('user_pairs', []),
+            pcvr_dataset.user_int_schema,
+            pcvr_dataset.user_dense_schema,
+            'user',
+        ),
+        'item_pairs': _resolve_pair_mapping(
+            cfg.get('item_pairs', []),
+            pcvr_dataset.item_int_schema,
+            pcvr_dataset.item_dense_schema,
+            'item',
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
@@ -200,6 +258,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer/hybrid mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--use_final_pair', action='store_true', default=False,
+                        help='Enable fid-aligned int-dense pair residual inject')
+    parser.add_argument('--final_pair_json', type=str, default='',
+                        help='JSON config for fid-aligned int/dense pairs')
 
     args = parser.parse_args()
 
@@ -279,12 +341,24 @@ def main() -> None:
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
+    final_pair_mappings = {'user_pairs': [], 'item_pairs': []}
+    if args.use_final_pair:
+        final_pair_cfg = _load_final_pair_config(args.final_pair_json)
+        final_pair_mappings = build_final_pair_mappings(final_pair_cfg, pcvr_dataset)
+        logging.info(
+            "[final_pair] enabled=True, user_pairs=%s, item_pairs=%s",
+            final_pair_mappings['user_pairs'],
+            final_pair_mappings['item_pairs'],
+        )
+    args.final_pair_mappings = final_pair_mappings
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "user_dense_feature_specs": list(pcvr_dataset.user_dense_schema.entries),
+        "item_dense_feature_specs": list(pcvr_dataset.item_dense_schema.entries),
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
@@ -310,6 +384,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_final_pair": args.use_final_pair,
+        "final_pair_mappings": final_pair_mappings,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

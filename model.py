@@ -1032,6 +1032,40 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
+    def _embed_one_fid(self, int_feats: torch.Tensor, fid_idx: int) -> torch.Tensor:
+        vs, offset, length = self.feature_specs[fid_idx]
+        emb_real_idx = self._emb_index[fid_idx]
+        if emb_real_idx == -1:
+            return int_feats.new_zeros(
+                int_feats.shape[0], self.emb_dim, dtype=torch.float32)
+
+        emb_layer = self.embs[emb_real_idx]
+        if length == 1:
+            return emb_layer(int_feats[:, offset].long())
+
+        vals = int_feats[:, offset:offset + length].long()
+        emb_all = emb_layer(vals)
+        mask = (vals != 0).float().unsqueeze(-1)
+        count = mask.sum(dim=1).clamp(min=1)
+        return (emb_all * mask).sum(dim=1) / count
+
+    def embed_fids(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Return one pooled embedding per discrete fid: (B, num_fids, emb_dim)."""
+        fid_embs = [
+            self._embed_one_fid(int_feats, fid_idx)
+            for fid_idx in range(len(self.feature_specs))
+        ]
+        return torch.stack(fid_embs, dim=1)
+
+    def forward_from_fid_embs(self, fid_embs_all: torch.Tensor) -> torch.Tensor:
+        """Project already-built fid embeddings into grouped NS tokens."""
+        tokens = []
+        for group, proj in zip(self.groups, self.group_projs):
+            fid_embs = [fid_embs_all[:, fid_idx, :] for fid_idx in group]
+            cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
+            tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
+        return torch.cat(tokens, dim=1)  # (B, num_groups, D)
+
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
@@ -1041,31 +1075,7 @@ class GroupNSTokenizer(nn.Module):
         Returns:
             Tokens of shape (B, num_groups, D).
         """
-        tokens = []
-        for group, proj in zip(self.groups, self.group_projs):
-            fid_embs = []
-            for fid_idx in group:
-                vs, offset, length = self.feature_specs[fid_idx]
-                emb_real_idx = self._emb_index[fid_idx]
-                if emb_real_idx == -1:
-                    # Filtered high-cardinality feature: output zero vector
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
-                else:
-                    emb_layer = self.embs[emb_real_idx]
-                    if length == 1:
-                        # Single-value feature: direct lookup
-                        fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
-                    else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
-                        vals = int_feats[:, offset:offset + length].long()  # (B, length)
-                        emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
-                fid_embs.append(fid_emb)
-            cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
-            tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
-        return torch.cat(tokens, dim=1)  # (B, num_groups, D)
+        return self.forward_from_fid_embs(self.embed_fids(int_feats))
 
 
 class RankMixerNSTokenizer(nn.Module):
@@ -1146,34 +1156,37 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
-        """Embeds all features, concatenates, splits, and projects.
+    def _embed_one_fid(self, int_feats: torch.Tensor, fid_idx: int) -> torch.Tensor:
+        vs, offset, length = self.feature_specs[fid_idx]
+        emb_real_idx = self._emb_index[fid_idx]
+        if emb_real_idx == -1:
+            return int_feats.new_zeros(
+                int_feats.shape[0], self.emb_dim, dtype=torch.float32)
 
-        Args:
-            int_feats: (B, total_int_dim) concatenated integer features.
+        emb_layer = self.embs[emb_real_idx]
+        if length == 1:
+            return emb_layer(int_feats[:, offset].long())
 
-        Returns:
-            (B, num_ns_tokens, d_model) tensor.
-        """
-        # 1. Embed all fids in group order → flat cat
+        vals = int_feats[:, offset:offset + length].long()
+        emb_all = emb_layer(vals)
+        mask = (vals != 0).float().unsqueeze(-1)
+        count = mask.sum(dim=1).clamp(min=1)
+        return (emb_all * mask).sum(dim=1) / count
+
+    def embed_fids(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Return one pooled embedding per discrete fid: (B, num_fids, emb_dim)."""
+        fid_embs = [
+            self._embed_one_fid(int_feats, fid_idx)
+            for fid_idx in range(len(self.feature_specs))
+        ]
+        return torch.stack(fid_embs, dim=1)
+
+    def forward_from_fid_embs(self, fid_embs_all: torch.Tensor) -> torch.Tensor:
+        """Build NS tokens from already-built fid embeddings."""
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
-                vs, offset, length = self.feature_specs[fid_idx]
-                emb_real_idx = self._emb_index[fid_idx]
-                if emb_real_idx == -1:
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
-                else:
-                    emb_layer = self.embs[emb_real_idx]
-                    if length == 1:
-                        fid_emb = emb_layer(int_feats[:, offset].long())
-                    else:
-                        vals = int_feats[:, offset:offset + length].long()
-                        emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
-                all_embs.append(fid_emb)
+                all_embs.append(fid_embs_all[:, fid_idx, :])
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
 
@@ -1189,7 +1202,9 @@ class RankMixerNSTokenizer(nn.Module):
 
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
-
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Embeds all features, concatenates, splits, and projects."""
+        return self.forward_from_fid_embs(self.embed_fids(int_feats))
 class HybridNSTokenizer(nn.Module):
     """Semantic-group tokenizer with learnable compression to fixed token count.
 
@@ -1256,13 +1271,85 @@ class HybridNSTokenizer(nn.Module):
                 )
                 self.mix_logits[token_idx, group_idx] = 2.0
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
-        """Build semantic group tokens, then compress them to fixed NS tokens."""
-        group_tokens = self.group_tokenizer(int_feats)  # (B, G, D)
+    def embed_fids(self, int_feats: torch.Tensor) -> torch.Tensor:
+        return self.group_tokenizer.embed_fids(int_feats)
+
+    def forward_from_fid_embs(self, fid_embs_all: torch.Tensor) -> torch.Tensor:
+        """Build semantic group tokens from fid embeddings, then compress."""
+        group_tokens = self.group_tokenizer.forward_from_fid_embs(fid_embs_all)
         weights = F.softmax(self.mix_logits, dim=-1)  # (K, G)
         tokens = torch.einsum('kg,bgd->bkd', weights, group_tokens)
         tokens = tokens + self.ffn(self.ffn_norm(tokens))
         return self.out_norm(tokens)
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Build semantic group tokens, then compress them to fixed NS tokens."""
+        return self.forward_from_fid_embs(self.embed_fids(int_feats))
+
+
+class FidPairResidualGate(nn.Module):
+    """Residual int-dense fid pair interaction without adding tokens."""
+
+    def __init__(
+        self,
+        d_model: int,
+        pair_mapping: List[Tuple[int, int]],
+        hidden_dim: Optional[int] = None,
+        dropout: float = 0.0,
+        gate_init: float = -1.0,
+        out_init_std: float = 1e-3,
+    ) -> None:
+        super().__init__()
+        self.pair_mapping = [(int(i), int(d)) for i, d in pair_mapping]
+        self.num_pairs = len(self.pair_mapping)
+        self.gate_init = float(gate_init)
+        self.out_init_std = float(out_init_std)
+        hidden_dim = int(hidden_dim or d_model)
+
+        if self.num_pairs == 0:
+            return
+
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(2 * d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.out_i = nn.Linear(hidden_dim, d_model)
+        self.out_d = nn.Linear(hidden_dim, d_model)
+        self.gate_i_logit = nn.Parameter(torch.full((self.num_pairs, 1), gate_init))
+        self.gate_d_logit = nn.Parameter(torch.full((self.num_pairs, 1), gate_init))
+
+        nn.init.normal_(self.out_i.weight, mean=0.0, std=out_init_std)
+        nn.init.normal_(self.out_d.weight, mean=0.0, std=out_init_std)
+        nn.init.zeros_(self.out_i.bias)
+        nn.init.zeros_(self.out_d.bias)
+
+    def forward(
+        self,
+        int_emb: torch.Tensor,
+        dense_emb: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.num_pairs == 0:
+            return int_emb, dense_emb
+
+        enhanced_int = int_emb.clone()
+        enhanced_dense = dense_emb.clone()
+
+        for pair_idx, (int_idx, dense_idx) in enumerate(self.pair_mapping):
+            int_x = int_emb[:, int_idx, :]
+            dense_x = dense_emb[:, dense_idx, :]
+            pair_x = torch.cat([int_x, dense_x], dim=-1)
+            h = self.pair_mlp(pair_x)
+            delta_i = self.out_i(h)
+            delta_d = self.out_d(h)
+            gate_i = torch.sigmoid(self.gate_i_logit[pair_idx]).view(1, 1)
+            gate_d = torch.sigmoid(self.gate_d_logit[pair_idx]).view(1, 1)
+            enhanced_int[:, int_idx, :] = int_x + gate_i * delta_i
+            enhanced_dense[:, dense_idx, :] = dense_x + gate_d * delta_d
+
+        return enhanced_int, enhanced_dense
 
 
 class PCVRHyFormer(nn.Module):
@@ -1283,6 +1370,8 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        item_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1307,6 +1396,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        use_final_pair: bool = False,
+        final_pair_mappings: Optional[dict] = None,
     ) -> None:
         super().__init__()
 
@@ -1324,6 +1415,22 @@ class PCVRHyFormer(nn.Module):
         self.use_time_context = use_time_context
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_final_pair = bool(use_final_pair)
+        final_pair_mappings = final_pair_mappings or {}
+        self.user_final_pair_mapping = [
+            (int(i), int(d))
+            for i, d in final_pair_mappings.get('user_pairs', [])
+        ]
+        self.item_final_pair_mapping = [
+            (int(i), int(d))
+            for i, d in final_pair_mappings.get('item_pairs', [])
+        ]
+        self.user_dense_feature_specs = user_dense_feature_specs or (
+            [(0, 0, user_dense_dim)] if user_dense_dim > 0 else []
+        )
+        self.item_dense_feature_specs = item_dense_feature_specs or (
+            [(0, 0, item_dense_dim)] if item_dense_dim > 0 else []
+        )
 
         # ================== NS Tokens Construction ==================
 
@@ -1415,6 +1522,67 @@ class PCVRHyFormer(nn.Module):
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
+            )
+
+        self.user_final_pair_active = (
+            self.use_final_pair
+            and len(self.user_final_pair_mapping) > 0
+            and self.has_user_dense
+        )
+        self.item_final_pair_active = (
+            self.use_final_pair
+            and len(self.item_final_pair_mapping) > 0
+            and self.has_item_dense
+        )
+        if self.use_final_pair:
+            gate_init_value = torch.sigmoid(torch.tensor(-1.0)).item()
+            num_pairs = (
+                len(self.user_final_pair_mapping)
+                + len(self.item_final_pair_mapping)
+            )
+            logging.info(
+                "[final_pair] enabled=True, num_pairs=%d, user_pairs=%d, item_pairs=%d, "
+                "gate_init=-1.0, gate_init_value=%.4f, out_init_std=1e-3",
+                num_pairs,
+                len(self.user_final_pair_mapping),
+                len(self.item_final_pair_mapping),
+                gate_init_value,
+            )
+        if self.user_final_pair_active:
+            self.user_dense_fid_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(length, emb_dim),
+                    nn.LayerNorm(emb_dim),
+                )
+                for _, _, length in self.user_dense_feature_specs
+            ])
+            self.user_dense_pair_proj = nn.Sequential(
+                nn.Linear(len(self.user_dense_feature_specs) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.user_final_pair = FidPairResidualGate(
+                d_model=emb_dim,
+                pair_mapping=self.user_final_pair_mapping,
+                hidden_dim=emb_dim,
+                dropout=0.0,
+            )
+        if self.item_final_pair_active:
+            self.item_dense_fid_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(length, emb_dim),
+                    nn.LayerNorm(emb_dim),
+                )
+                for _, _, length in self.item_dense_feature_specs
+            ])
+            self.item_dense_pair_proj = nn.Sequential(
+                nn.Linear(len(self.item_dense_feature_specs) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.item_final_pair = FidPairResidualGate(
+                d_model=emb_dim,
+                pair_mapping=self.item_final_pair_mapping,
+                hidden_dim=emb_dim,
+                dropout=0.0,
             )
 
         if self.use_time_context:
@@ -1719,18 +1887,72 @@ class PCVRHyFormer(nn.Module):
             torch.cos(week_angle),
         ], dim=-1)
 
+    def _embed_dense_fids(
+        self,
+        dense_feats: torch.Tensor,
+        dense_feature_specs: List[Tuple[int, int, int]],
+        dense_fid_projs: nn.ModuleList,
+    ) -> torch.Tensor:
+        """Project each dense fid to emb_dim: (B, num_dense_fids, emb_dim)."""
+        dense_embs = []
+        for (_, offset, length), proj in zip(dense_feature_specs, dense_fid_projs):
+            dense_x = dense_feats[:, offset:offset + length].float()
+            dense_embs.append(proj(dense_x))
+        return torch.stack(dense_embs, dim=1)
+
+    @staticmethod
+    def _dense_token_from_fid_embs(
+        dense_embs: torch.Tensor,
+        dense_pair_proj: nn.Module,
+    ) -> torch.Tensor:
+        flat = dense_embs.reshape(dense_embs.shape[0], -1)
+        return F.silu(dense_pair_proj(flat)).unsqueeze(1)
+
     def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
         """Build all non-sequence tokens, including optional time context."""
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+        user_dense_tok = None
+        if self.user_final_pair_active:
+            user_int_emb = self.user_ns_tokenizer.embed_fids(inputs.user_int_feats)
+            user_dense_emb = self._embed_dense_fids(
+                inputs.user_dense_feats,
+                self.user_dense_feature_specs,
+                self.user_dense_fid_projs,
+            )
+            user_int_emb, user_dense_emb = self.user_final_pair(
+                user_int_emb, user_dense_emb)
+            user_ns = self.user_ns_tokenizer.forward_from_fid_embs(user_int_emb)
+            user_dense_tok = self._dense_token_from_fid_embs(
+                user_dense_emb, self.user_dense_pair_proj)
+        else:
+            user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+
+        item_dense_tok = None
+        if self.item_final_pair_active:
+            item_int_emb = self.item_ns_tokenizer.embed_fids(inputs.item_int_feats)
+            item_dense_emb = self._embed_dense_fids(
+                inputs.item_dense_feats,
+                self.item_dense_feature_specs,
+                self.item_dense_fid_projs,
+            )
+            item_int_emb, item_dense_emb = self.item_final_pair(
+                item_int_emb, item_dense_emb)
+            item_ns = self.item_ns_tokenizer.forward_from_fid_embs(item_int_emb)
+            item_dense_tok = self._dense_token_from_fid_embs(
+                item_dense_emb, self.item_dense_pair_proj)
+        else:
+            item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            if user_dense_tok is None:
+                user_dense_tok = F.silu(
+                    self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            if item_dense_tok is None:
+                item_dense_tok = F.silu(
+                    self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
         if self.use_time_context:
             time_feats = self._build_time_context_features(inputs.timestamp)
