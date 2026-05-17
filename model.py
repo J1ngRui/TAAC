@@ -1422,7 +1422,6 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(4, d_model),
                 nn.LayerNorm(d_model),
             )
-            self.time_context_dropout = nn.Dropout(0.02)
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)

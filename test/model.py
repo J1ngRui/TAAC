@@ -1422,7 +1422,6 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(4, d_model),
                 nn.LayerNorm(d_model),
             )
-            self.time_context_dropout = nn.Dropout(0.02)
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
@@ -1736,7 +1735,6 @@ class PCVRHyFormer(nn.Module):
         if self.use_time_context:
             time_feats = self._build_time_context_features(inputs.timestamp)
             time_context_tok = F.gelu(self.time_context_proj(time_feats)).unsqueeze(1)
-            time_context_tok = self.time_context_dropout(time_context_tok)
             ns_parts.append(time_context_tok)
 
         return torch.cat(ns_parts, dim=1)
