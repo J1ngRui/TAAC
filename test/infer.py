@@ -39,8 +39,8 @@ logging.basicConfig(
 # Fallback values used only when ``train_config.json`` is missing from the
 # ckpt directory.
 #
-# These MUST match the argparse defaults in ``train.py``; otherwise once the
-# fallback path is actually taken the built model will shape-mismatch the
+# These MUST match the final training command in ``run.sh``; otherwise once
+# the fallback path is actually taken the built model will shape-mismatch the
 # saved state_dict.
 #
 # Special note on ``num_time_buckets``: this value is strictly determined by
@@ -48,9 +48,9 @@ logging.basicConfig(
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
 _FALLBACK_MODEL_CFG = {
-    'd_model': 64,
+    'd_model': 84,
     'emb_dim': 64,
-    'num_queries': 1,
+    'num_queries': 2,
     'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
@@ -63,11 +63,11 @@ _FALLBACK_MODEL_CFG = {
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
-    'emb_skip_threshold': 0,
+    'emb_skip_threshold': 1000000,
     'seq_id_threshold': 10000,
-    'use_time_context': False,
+    'use_time_context': True,
     'time_context_tz_offset_hours': 8.0,
-    'ns_tokenizer_type': 'rankmixer',
+    'ns_tokenizer_type': 'group',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
     'use_final_pair': False,
@@ -76,12 +76,19 @@ _FALLBACK_MODEL_CFG = {
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
 _FALLBACK_BATCH_SIZE = 256
-_FALLBACK_NUM_WORKERS = 16
+_FALLBACK_NUM_WORKERS = 8
 
 
 # Hyperparameter keys used to build the model. Everything else in
 # ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_FALLBACK_NS_GROUPS_CANDIDATES = [
+    os.path.join(_SCRIPT_DIR, 'ns_groups.json'),
+    os.path.join(os.getcwd(), 'ns_groups.json'),
+    os.path.join(os.path.dirname(_SCRIPT_DIR), 'ns_groups.json'),
+]
 
 
 def build_feature_specs(
@@ -161,6 +168,39 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
             logging.warning(
                 f"train_config missing '{key}', using fallback = {cfg[key]}")
     return cfg
+
+
+def resolve_ns_groups_json(
+    train_config: Dict[str, Any],
+    model_dir: str,
+) -> Optional[str]:
+    """Resolve the NS-groups JSON used to rebuild the model.
+
+    Normal checkpoints store the path in ``train_config.json`` and usually
+    carry a portable copy next to ``model.pt``. Older final checkpoints may
+    miss ``train_config.json`` entirely, so fall back to the bundled final
+    grouping file.
+    """
+    ns_groups_json = train_config.get('ns_groups_json', None)
+    if ns_groups_json:
+        local_candidate = os.path.join(model_dir, os.path.basename(ns_groups_json))
+        if os.path.exists(local_candidate):
+            return local_candidate
+        if os.path.exists(ns_groups_json):
+            return ns_groups_json
+        logging.warning(
+            f"Configured ns_groups_json={ns_groups_json!r} was not found; "
+            "trying bundled fallback candidates.")
+
+    for candidate in _FALLBACK_NS_GROUPS_CANDIDATES:
+        if os.path.exists(candidate):
+            logging.info(f"Using fallback NS groups from {candidate}")
+            return candidate
+
+    logging.warning(
+        "No ns_groups.json found in checkpoint, script directory, cwd, or "
+        "project root; using singleton NS groups.")
+    return None
 
 
 def build_model(
@@ -357,16 +397,10 @@ def main() -> None:
     # ---- Build model: every structural hyperparameter is resolved from train_config ----
     model_cfg = resolve_model_cfg(train_config)
 
-    # ns_groups_json also comes from training config (e.g. run.sh may have
-    # passed an empty string to disable it). When trainer.py has copied the
-    # JSON into the ckpt dir, train_config records just the basename, so try
-    # resolving against ``model_dir`` first before honoring the raw (possibly
-    # absolute) path as a fallback.
-    ns_groups_json = train_config.get('ns_groups_json', None)
-    if ns_groups_json:
-        local_candidate = os.path.join(model_dir, os.path.basename(ns_groups_json))
-        if os.path.exists(local_candidate):
-            ns_groups_json = local_candidate
+    # Prefer the NS groups recorded in train_config, but tolerate older final
+    # checkpoints that missed train_config.json by falling back to the bundled
+    # final grouping file.
+    ns_groups_json = resolve_ns_groups_json(train_config, model_dir)
 
     model = build_model(
         test_dataset,
