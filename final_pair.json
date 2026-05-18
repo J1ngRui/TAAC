@@ -19,18 +19,6 @@
     {
       "int_fid": 66,
       "dense_fid": 66
-    },
-    {
-      "int_fid": 89,
-      "dense_fid": 89
-    },
-    {
-      "int_fid": 90,
-      "dense_fid": 90
-    },
-    {
-      "int_fid": 91,
-      "dense_fid": 91
     }
   ],
   "item_pairs": []
