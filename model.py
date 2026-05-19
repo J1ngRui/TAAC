@@ -1556,7 +1556,8 @@ class PCVRHyFormer(nn.Module):
                 gate_init_value,
             )
         if self.use_full_time_user_features:
-            self.full_time_int_vocab_sizes = [24, 7, 6, 2, 65, 16, 16]
+            self.full_time_int_vocab_sizes = [24, 7, 6, 2]
+            self.full_time_rel_vocab_sizes = [65, 16, 16, 65]
             self.register_buffer(
                 "full_time_delta_boundaries",
                 torch.tensor([
@@ -1575,6 +1576,19 @@ class PCVRHyFormer(nn.Module):
                 nn.Embedding(vocab_size, emb_dim)
                 for vocab_size in self.full_time_int_vocab_sizes
             ])
+            self.full_time_rel_embs = nn.ModuleList([
+                nn.Embedding(vocab_size, d_model)
+                for vocab_size in self.full_time_rel_vocab_sizes
+            ])
+            self.full_time_rel_norm = nn.LayerNorm(d_model)
+            self.full_time_rel_film = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.LayerNorm(d_model),
+                nn.Linear(d_model, 2 * d_model),
+            )
+            self.full_time_rel_film_gate_logit = nn.Parameter(
+                torch.tensor(-3.0, dtype=torch.float32))
             self.full_time_int_group_proj = nn.Sequential(
                 nn.Linear(len(self.full_time_int_vocab_sizes) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -1797,6 +1811,16 @@ class PCVRHyFormer(nn.Module):
         if self.use_full_time_user_features:
             for emb in self.full_time_int_embs:
                 nn.init.xavier_normal_(emb.weight.data)
+            for emb in self.full_time_rel_embs:
+                nn.init.xavier_normal_(emb.weight.data)
+            final = self.full_time_rel_film[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
+            logging.info(
+                "[full_time_rel_film] enabled=True, gate_init=%.4f, "
+                "film_scale=0.2, out_init=zeros",
+                torch.sigmoid(self.full_time_rel_film_gate_logit.detach()).item(),
+            )
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1945,8 +1969,8 @@ class PCVRHyFormer(nn.Module):
     def _build_full_time_user_embs(
         self,
         inputs: ModelInput,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build generated user-side time int/dense fid embeddings."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build current-time embeddings plus relative-time FiLM features."""
         ts = inputs.timestamp.to(dtype=torch.float32)
         local_ts = ts + float(self.time_context_tz_offset_hours) * 3600.0
         seconds_per_day = 86400.0
@@ -1998,14 +2022,33 @@ class PCVRHyFormer(nn.Module):
         recent_1h_bucket = self._count_bucket(recent_1h_count)
         recent_1d_bucket = self._count_bucket(recent_1d_count)
 
+        valid_count = valid_all.sum(dim=1)
+        mean_delta = torch.where(
+            valid_count > 0,
+            torch.where(valid_all, delta_all, torch.zeros_like(delta_all)).sum(dim=1)
+            / valid_count.clamp(min=1).to(dtype=torch.float32),
+            torch.zeros_like(ts),
+        )
+        raw_mean_gap_bucket = torch.bucketize(mean_delta, self.full_time_delta_boundaries)
+        raw_mean_gap_bucket = raw_mean_gap_bucket.clamp(
+            0, self.full_time_delta_boundaries.numel() - 1) + 1
+        mean_behavior_gap_bucket = torch.where(
+            valid_count > 0,
+            raw_mean_gap_bucket,
+            torch.zeros_like(raw_mean_gap_bucket),
+        ).long()
+
         time_int_feats = torch.stack([
             hour_of_day,
             day_of_week,
             period,
             is_weekend,
+        ], dim=1)
+        rel_time_feats = torch.stack([
             delta_last_behavior_bucket,
             recent_1h_bucket,
             recent_1d_bucket,
+            mean_behavior_gap_bucket,
         ], dim=1)
         int_embs = []
         for idx, emb in enumerate(self.full_time_int_embs):
@@ -2017,11 +2060,28 @@ class PCVRHyFormer(nn.Module):
         week_cycle_feat = self.full_time_cycle_mlp(cyclic[:, 2:])
         dense_embs = torch.stack([day_cycle_feat, week_cycle_feat], dim=1)
 
-        return torch.stack(int_embs, dim=1), dense_embs
+        return torch.stack(int_embs, dim=1), dense_embs, rel_time_feats
 
     def _full_time_int_token_from_embs(self, int_embs: torch.Tensor) -> torch.Tensor:
         flat = int_embs.reshape(int_embs.shape[0], -1)
         return F.silu(self.full_time_int_group_proj(flat)).unsqueeze(1)
+
+    def _apply_full_time_rel_film(
+        self,
+        cur_time_tok: torch.Tensor,
+        rel_time_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        rel_embs = []
+        for idx, emb in enumerate(self.full_time_rel_embs):
+            value = rel_time_feats[:, idx].clamp(0, emb.num_embeddings - 1)
+            rel_embs.append(emb(value))
+        rel_emb = self.full_time_rel_norm(torch.stack(rel_embs, dim=0).sum(dim=0))
+        film = self.full_time_rel_film(rel_emb)
+        gamma, beta = film.chunk(2, dim=-1)
+        gamma = 0.2 * torch.tanh(gamma)
+        beta = 0.2 * torch.tanh(beta)
+        gate = torch.sigmoid(self.full_time_rel_film_gate_logit)
+        return cur_time_tok * (1.0 + gate * gamma) + gate * beta
 
     def _embed_dense_fids(
         self,
@@ -2049,13 +2109,17 @@ class PCVRHyFormer(nn.Module):
         user_dense_tok = None
         user_time_int_tok = None
         full_time_dense_emb = None
+        rel_time_feats = None
         if self.use_full_time_user_features:
-            full_time_int_emb, full_time_dense_emb = self._build_full_time_user_embs(inputs)
+            full_time_int_emb, full_time_dense_emb, rel_time_feats = (
+                self._build_full_time_user_embs(inputs))
             full_time_int_emb, full_time_dense_emb = self.full_time_pair(
                 full_time_int_emb,
                 full_time_dense_emb,
             )
             user_time_int_tok = self._full_time_int_token_from_embs(full_time_int_emb)
+            user_time_int_tok = self._apply_full_time_rel_film(
+                user_time_int_tok.squeeze(1), rel_time_feats).unsqueeze(1)
 
         if self.user_dense_fid_mode:
             user_int_emb = self.user_ns_tokenizer.embed_fids(inputs.user_int_feats)
