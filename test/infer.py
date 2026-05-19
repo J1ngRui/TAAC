@@ -65,8 +65,9 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 1000000,
     'seq_id_threshold': 10000,
-    'use_time_context': True,
+    'use_time_context': False,
     'time_context_tz_offset_hours': 8.0,
+    'use_full_time_user_features': True,
     'ns_tokenizer_type': 'group',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
@@ -333,12 +334,16 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_timestamps: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
         B, _, L = device_batch[domain].shape
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_timestamps[domain] = device_batch.get(
+            f'{domain}_timestamp',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
     return ModelInput(
@@ -350,6 +355,7 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_timestamps=seq_timestamps,
     )
 
 

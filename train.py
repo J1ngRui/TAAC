@@ -186,6 +186,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--time_context_tz_offset_hours', type=float, default=8.0,
                         help='Timezone offset used for timestamp cyclic features '
                              '(default: 8.0 for UTC+8)')
+    parser.add_argument('--use_full_time_user_features', action='store_true', default=False,
+                        help='Add generated user-side time int/dense features and time pairs')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -381,6 +383,7 @@ def main() -> None:
         "seq_id_threshold": args.seq_id_threshold,
         "use_time_context": args.use_time_context,
         "time_context_tz_offset_hours": args.time_context_tz_offset_hours,
+        "use_full_time_user_features": args.use_full_time_user_features,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,

@@ -2,13 +2,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: one token per semantic group + current-time context ----
+# ---- Active config: final_pair + user-side full-time features ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type group \
     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
     --num_queries 2 \
-    --use_time_context \
     --time_context_tz_offset_hours 8 \
+    --use_full_time_user_features \
     --d_model 84 \
     --rank_mixer_mode full \
     --use_final_pair \

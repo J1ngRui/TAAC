@@ -381,6 +381,7 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        seq_timestamps: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -388,6 +389,9 @@ class PCVRHyFormerRankingTrainer:
             L = device_batch[domain].shape[2]
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
+                torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_timestamps[domain] = device_batch.get(
+                f'{domain}_timestamp',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
@@ -398,6 +402,7 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_timestamps=seq_timestamps,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:

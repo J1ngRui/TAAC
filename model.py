@@ -17,6 +17,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_timestamps: dict  # {domain: tensor [B, L]}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1392,6 +1393,7 @@ class PCVRHyFormer(nn.Module):
         seq_id_threshold: int = 10000,
         use_time_context: bool = False,
         time_context_tz_offset_hours: float = 8.0,
+        use_full_time_user_features: bool = False,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1411,8 +1413,9 @@ class PCVRHyFormer(nn.Module):
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
+        self.use_full_time_user_features = bool(use_full_time_user_features)
         self.seq_id_threshold = seq_id_threshold
-        self.use_time_context = use_time_context
+        self.use_time_context = bool(use_time_context) and not self.use_full_time_user_features
         self.time_context_tz_offset_hours = time_context_tz_offset_hours
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_final_pair = bool(use_final_pair)
@@ -1510,6 +1513,7 @@ class PCVRHyFormer(nn.Module):
 
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
+        self.has_user_dense_token = self.has_user_dense or self.use_full_time_user_features
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
                 nn.Linear(user_dense_dim, d_model),
@@ -1528,6 +1532,9 @@ class PCVRHyFormer(nn.Module):
             self.use_final_pair
             and len(self.user_final_pair_mapping) > 0
             and self.has_user_dense
+        )
+        self.user_dense_fid_mode = (
+            self.user_final_pair_active or self.use_full_time_user_features
         )
         self.item_final_pair_active = (
             self.use_final_pair
@@ -1548,7 +1555,42 @@ class PCVRHyFormer(nn.Module):
                 len(self.item_final_pair_mapping),
                 gate_init_value,
             )
-        if self.user_final_pair_active:
+        if self.use_full_time_user_features:
+            self.full_time_int_vocab_sizes = [24, 7, 6, 2, 65, 16, 16]
+            self.register_buffer(
+                "full_time_delta_boundaries",
+                torch.tensor([
+                    5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
+                    120, 180, 240, 300, 360, 420, 480, 540, 600,
+                    900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600,
+                    5400, 7200, 9000, 10800, 12600, 14400, 16200, 18000,
+                    19800, 21600, 32400, 43200, 54000, 64800, 75600, 86400,
+                    172800, 259200, 345600, 432000, 518400, 604800,
+                    1123200, 1641600, 2160000, 2592000, 4320000, 6048000,
+                    7776000, 11664000, 15552000, 31536000,
+                ], dtype=torch.float32),
+                persistent=False,
+            )
+            self.full_time_int_embs = nn.ModuleList([
+                nn.Embedding(vocab_size, emb_dim)
+                for vocab_size in self.full_time_int_vocab_sizes
+            ])
+            self.full_time_int_group_proj = nn.Sequential(
+                nn.Linear(len(self.full_time_int_vocab_sizes) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.full_time_cycle_mlp = nn.Sequential(
+                nn.Linear(2, emb_dim),
+                nn.LayerNorm(emb_dim),
+            )
+            self.full_time_pair = FidPairResidualGate(
+                d_model=emb_dim,
+                pair_mapping=[(0, 0), (1, 1)],
+                hidden_dim=emb_dim,
+                dropout=0.0,
+            )
+
+        if self.user_dense_fid_mode:
             self.user_dense_fid_projs = nn.ModuleList([
                 nn.Sequential(
                     nn.Linear(length, emb_dim),
@@ -1556,10 +1598,14 @@ class PCVRHyFormer(nn.Module):
                 )
                 for _, _, length in self.user_dense_feature_specs
             ])
+            user_dense_fid_count = len(self.user_dense_feature_specs)
+            if self.use_full_time_user_features:
+                user_dense_fid_count += 2
             self.user_dense_pair_proj = nn.Sequential(
-                nn.Linear(len(self.user_dense_feature_specs) * emb_dim, d_model),
+                nn.Linear(user_dense_fid_count * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+        if self.user_final_pair_active:
             self.user_final_pair = FidPairResidualGate(
                 d_model=emb_dim,
                 pair_mapping=self.user_final_pair_mapping,
@@ -1592,7 +1638,8 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_ns = (num_user_ns + (1 if self.use_full_time_user_features else 0)
+                       + (1 if self.has_user_dense_token else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0)
                        + (1 if self.use_time_context else 0))
 
@@ -1747,6 +1794,9 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+        if self.use_full_time_user_features:
+            for emb in self.full_time_int_embs:
+                nn.init.xavier_normal_(emb.weight.data)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1887,6 +1937,92 @@ class PCVRHyFormer(nn.Module):
             torch.cos(week_angle),
         ], dim=-1)
 
+    @staticmethod
+    def _count_bucket(count: torch.Tensor, max_bucket: int = 15) -> torch.Tensor:
+        bucket = torch.floor(torch.log2(count.to(dtype=torch.float32) + 1.0)).long()
+        return bucket.clamp(0, max_bucket)
+
+    def _build_full_time_user_embs(
+        self,
+        inputs: ModelInput,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build generated user-side time int/dense fid embeddings."""
+        ts = inputs.timestamp.to(dtype=torch.float32)
+        local_ts = ts + float(self.time_context_tz_offset_hours) * 3600.0
+        seconds_per_day = 86400.0
+        seconds_of_day = torch.remainder(local_ts, seconds_per_day)
+        hour_of_day = torch.floor(seconds_of_day / 3600.0).long().clamp(0, 23)
+        day_index = torch.floor(local_ts / seconds_per_day)
+        day_of_week = torch.remainder(day_index + 3.0, 7.0).long().clamp(0, 6)
+
+        period = torch.zeros_like(hour_of_day)
+        period = torch.where((hour_of_day >= 6) & (hour_of_day <= 10), 1, period)
+        period = torch.where((hour_of_day >= 11) & (hour_of_day <= 13), 2, period)
+        period = torch.where((hour_of_day >= 14) & (hour_of_day <= 17), 3, period)
+        period = torch.where((hour_of_day >= 18) & (hour_of_day <= 20), 4, period)
+        period = torch.where(hour_of_day >= 21, 5, period)
+        is_weekend = (day_of_week >= 5).long()
+
+        all_ts = []
+        all_valid = []
+        for domain in self.seq_domains:
+            seq_ts = inputs.seq_timestamps.get(domain)
+            if seq_ts is None:
+                B, L = inputs.seq_time_buckets[domain].shape
+                seq_ts = torch.zeros(B, L, dtype=torch.long, device=ts.device)
+            seq_ts = seq_ts.to(device=ts.device, dtype=torch.float32)
+            L = seq_ts.shape[1]
+            pos = torch.arange(L, device=ts.device).unsqueeze(0)
+            valid_len = inputs.seq_lens[domain].to(device=ts.device).unsqueeze(1)
+            valid = (pos < valid_len) & (seq_ts > 0) & (seq_ts < ts.unsqueeze(1))
+            all_ts.append(seq_ts)
+            all_valid.append(valid)
+
+        ts_all = torch.cat(all_ts, dim=1)
+        valid_all = torch.cat(all_valid, dim=1)
+        delta_all = ts.unsqueeze(1) - ts_all
+        large_delta = torch.full_like(delta_all, 1.0e18)
+        valid_delta = torch.where(valid_all, delta_all, large_delta)
+        min_delta = valid_delta.min(dim=1).values
+        has_event = min_delta < 1.0e18
+        raw_delta_bucket = torch.bucketize(min_delta, self.full_time_delta_boundaries)
+        raw_delta_bucket = raw_delta_bucket.clamp(0, self.full_time_delta_boundaries.numel() - 1) + 1
+        delta_last_behavior_bucket = torch.where(
+            has_event,
+            raw_delta_bucket,
+            torch.zeros_like(raw_delta_bucket),
+        ).long()
+
+        recent_1h_count = (valid_all & (delta_all <= 3600.0)).sum(dim=1)
+        recent_1d_count = (valid_all & (delta_all <= 86400.0)).sum(dim=1)
+        recent_1h_bucket = self._count_bucket(recent_1h_count)
+        recent_1d_bucket = self._count_bucket(recent_1d_count)
+
+        time_int_feats = torch.stack([
+            hour_of_day,
+            day_of_week,
+            period,
+            is_weekend,
+            delta_last_behavior_bucket,
+            recent_1h_bucket,
+            recent_1d_bucket,
+        ], dim=1)
+        int_embs = []
+        for idx, emb in enumerate(self.full_time_int_embs):
+            value = time_int_feats[:, idx].clamp(0, emb.num_embeddings - 1)
+            int_embs.append(emb(value))
+
+        cyclic = self._build_time_context_features(inputs.timestamp)
+        day_cycle_feat = self.full_time_cycle_mlp(cyclic[:, :2])
+        week_cycle_feat = self.full_time_cycle_mlp(cyclic[:, 2:])
+        dense_embs = torch.stack([day_cycle_feat, week_cycle_feat], dim=1)
+
+        return torch.stack(int_embs, dim=1), dense_embs
+
+    def _full_time_int_token_from_embs(self, int_embs: torch.Tensor) -> torch.Tensor:
+        flat = int_embs.reshape(int_embs.shape[0], -1)
+        return F.silu(self.full_time_int_group_proj(flat)).unsqueeze(1)
+
     def _embed_dense_fids(
         self,
         dense_feats: torch.Tensor,
@@ -1911,18 +2047,39 @@ class PCVRHyFormer(nn.Module):
     def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
         """Build all non-sequence tokens, including optional time context."""
         user_dense_tok = None
-        if self.user_final_pair_active:
-            user_int_emb = self.user_ns_tokenizer.embed_fids(inputs.user_int_feats)
-            user_dense_emb = self._embed_dense_fids(
-                inputs.user_dense_feats,
-                self.user_dense_feature_specs,
-                self.user_dense_fid_projs,
+        user_time_int_tok = None
+        full_time_dense_emb = None
+        if self.use_full_time_user_features:
+            full_time_int_emb, full_time_dense_emb = self._build_full_time_user_embs(inputs)
+            full_time_int_emb, full_time_dense_emb = self.full_time_pair(
+                full_time_int_emb,
+                full_time_dense_emb,
             )
-            user_int_emb, user_dense_emb = self.user_final_pair(
-                user_int_emb, user_dense_emb)
+            user_time_int_tok = self._full_time_int_token_from_embs(full_time_int_emb)
+
+        if self.user_dense_fid_mode:
+            user_int_emb = self.user_ns_tokenizer.embed_fids(inputs.user_int_feats)
+            dense_parts = []
+            if self.has_user_dense:
+                user_dense_emb = self._embed_dense_fids(
+                    inputs.user_dense_feats,
+                    self.user_dense_feature_specs,
+                    self.user_dense_fid_projs,
+                )
+                if self.user_final_pair_active:
+                    user_int_emb, user_dense_emb = self.user_final_pair(
+                        user_int_emb,
+                        user_dense_emb,
+                    )
+                dense_parts.append(user_dense_emb)
+            if full_time_dense_emb is not None:
+                dense_parts.append(full_time_dense_emb)
             user_ns = self.user_ns_tokenizer.forward_from_fid_embs(user_int_emb)
-            user_dense_tok = self._dense_token_from_fid_embs(
-                user_dense_emb, self.user_dense_pair_proj)
+            if dense_parts:
+                user_dense_tok = self._dense_token_from_fid_embs(
+                    torch.cat(dense_parts, dim=1),
+                    self.user_dense_pair_proj,
+                )
         else:
             user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
 
@@ -1943,7 +2100,9 @@ class PCVRHyFormer(nn.Module):
             item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
-        if self.has_user_dense:
+        if user_time_int_tok is not None:
+            ns_parts.append(user_time_int_tok)
+        if self.has_user_dense_token:
             if user_dense_tok is None:
                 user_dense_tok = F.silu(
                     self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)

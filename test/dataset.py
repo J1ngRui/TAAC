@@ -630,12 +630,12 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            ts_padded = np.zeros((B, max_len), dtype=np.int64)
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
                 # Pad timestamps into shape (B, max_len).
-                ts_padded = np.zeros((B, max_len), dtype=np.int64)
                 for i in range(B):
                     s = int(ts_offs[i])
                     e = int(ts_offs[i + 1])
@@ -665,6 +665,7 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_timestamp'] = torch.from_numpy(ts_padded.copy())
 
         return result
 
