@@ -1718,6 +1718,8 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+        self.seq_hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+        self.seq_hour_gate_logit = nn.Parameter(torch.tensor(-3.0, dtype=torch.float32))
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1808,6 +1810,12 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+        nn.init.xavier_normal_(self.seq_hour_embedding.weight.data)
+        self.seq_hour_embedding.weight.data[0, :] = 0
+        logging.info(
+            "[seq_hour] enabled=True, gate_init=%.4f",
+            torch.sigmoid(self.seq_hour_gate_logit.detach()).item(),
+        )
         if self.use_full_time_user_features:
             for emb in self.full_time_int_embs:
                 nn.init.xavier_normal_(emb.weight.data)
@@ -1904,6 +1912,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        seq_timestamps: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1925,6 +1934,15 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        if seq_timestamps is not None:
+            seq_ts = seq_timestamps.to(device=token_emb.device, dtype=torch.float32)
+            local_ts = seq_ts + float(self.time_context_tz_offset_hours) * 3600.0
+            seconds_of_day = torch.remainder(local_ts, 86400.0)
+            seq_hour = torch.floor(seconds_of_day / 3600.0).long().clamp(0, 23) + 1
+            seq_hour = torch.where(seq_ts > 0, seq_hour, torch.zeros_like(seq_hour))
+            gate = torch.sigmoid(self.seq_hour_gate_logit)
+            token_emb = token_emb + gate * self.seq_hour_embedding(seq_hour)
 
         return token_emb
 
@@ -2247,7 +2265,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_timestamps.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2276,7 +2295,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_timestamps.get(domain))
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
