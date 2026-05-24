@@ -1,14 +1,8 @@
-# TAAC 2026 PCVR 实验记录
-
-本仓库记录 TAAC 2026 PCVR 任务的建模代码、关键实验路线和最终保留分支。
+# TAAC 2026 PCVR
 
 ## 比赛结果
 
 ![Team Performance](assets/team-performance.png)
-
-| 赛道 | 排名 | Best Score | 最佳提交时间 |
-| --- | ---: | ---: | --- |
-| Academic Track | 334 | 0.827799 | 2026-05-23 12:23:21 |
 
 ## 当前保留分支
 
@@ -108,31 +102,6 @@ ns_groups.json
 bash run.sh
 ```
 
-平台环境变量：
-
-```text
-TRAIN_DATA_PATH
-TRAIN_CKPT_PATH
-TRAIN_LOG_PATH
-```
-
-## 推理
-
-平台推理入口固定为：
-
-```python
-from infer import main
-```
-
-因此提交推理包时，`infer.py` 必须位于包根目录，并且要和对应 checkpoint 的
-`model.py`、`dataset.py`、`ns_groups.json` 保持一致。
-
-## 分支清理原则
-
-旧的 focal、fulldata、DIN、miss/ref/gact、time-context 中间实验分支已清理。
-
-后续如果需要复现某个 A/B，应从明确的保留分支重新拉出新分支，避免继续在旧实验分支上叠变量。
-
 <details>
 <summary>实验记录</summary>
 
@@ -218,17 +187,6 @@ Epoch 5 Validation | AUC: 0.866992, LogLoss: 0.221450
 Epoch 6 Validation | AUC: 0.866849, LogLoss: 0.222424
 Epoch 7 Validation | AUC: 0.866868, LogLoss: 0.221543
 Test AUC: 0.827799
-```
-
-### ft2_seqhour_wideLogitsFusion
-
-```text
-Epoch 1 Validation | AUC: 0.863438, LogLoss: 0.224088
-Epoch 2 Validation | AUC: 0.864955, LogLoss: 0.222324
-Epoch 3 Validation | AUC: 0.866489, LogLoss: 0.222420
-Epoch 4 Validation | AUC: 0.866578, LogLoss: 0.220910
-Epoch 5 Validation | AUC: 0.866668, LogLoss: 0.221447
-Epoch 6 Validation | AUC: 0.865821, LogLoss: 0.221991
 ```
 
 </details>
