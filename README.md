@@ -3,6 +3,16 @@
 This repository contains the current TAAC 2026 PCVR modeling code and the
 remaining clean experiment baselines.
 
+## Competition Result
+
+![Team Performance](assets/team-performance.png)
+
+Final academic track result:
+
+| Rank | Best Score | Best Score Submission Time |
+| ---: | ---: | --- |
+| 334 | 0.827799 | 2026-05-23 12:23:21 |
+
 ## Data Summary
 
 | Feature group | Count | Type | Notes |
