@@ -38,6 +38,16 @@ RankMixer full mode
 
 ## 关键模块
 
+### full-time user features
+
+时间特征从独立 `time_context_token` 转移到 user 侧表达中。
+
+核心思路：
+
+- 绝对时间作为 user int 侧离散特征。
+- 周期 sin/cos 作为 user dense 侧连续特征。
+- 通过轻量交互让离散时间与周期时间互相补充。
+
 ### final_pair
 
 `FidPairResidualGate` 在 fid-level 阶段对齐 user int 和 user dense 表征。
@@ -55,16 +65,6 @@ pair 配置文件：
 final_pair.json
 ```
 
-### full-time user features
-
-时间特征从独立 `time_context_token` 转移到 user 侧表达中。
-
-核心思路：
-
-- 绝对时间作为 user int 侧离散特征。
-- 周期 sin/cos 作为 user dense 侧连续特征。
-- 通过轻量交互让离散时间与周期时间互相补充。
-
 ### seqhour
 
 `seqhour` 是后期保留的有效增强之一，用于补充历史序列中的小时级时间信息。
@@ -73,26 +73,12 @@ final_pair.json
 
 ### UE-wide / semi-local 说明
 
-部分后期提交曾使用：
+部分后期提交曾使
 
 ```text
 UE-wide logits fusion
 semi-local sequence encoder
 ```
-
-这类 checkpoint 必须使用与训练时完全一致的 `model.py` 推理，否则会因为
-`ue_wide_*` 参数不匹配导致 strict load 失败。
-
-如果要提交这类 checkpoint，请保证推理包根目录至少包含：
-
-```text
-dataset.py
-infer.py
-model.py
-ns_groups.json
-```
-
-并且 `infer.py` 需要加载同目录下的 `dataset.py` 和 `model.py`。
 
 ## 训练
 
